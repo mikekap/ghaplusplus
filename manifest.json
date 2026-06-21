@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "GHA++",
+  "version": "0.1.0",
+  "description": "Improves the GitHub Actions job experience.",
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
