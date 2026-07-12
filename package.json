@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "tsc",
+    "build": "npm run build:wasm && tsc",
+    "build:wasm": "wasm-pack build wasm --target web --out-dir ../dist/wasm --out-name ghaplusplus_wasm",
     "check": "tsc --noEmit",
     "watch": "tsc --watch"
   },

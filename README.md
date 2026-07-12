@@ -29,6 +29,9 @@ npm install
 npm run build
 ```
 
+The build also requires Rust, the `wasm32-unknown-unknown` target, and
+`wasm-pack`.
+
 Source code lives in `src/`; Chrome loads the compiled `dist/content.js`.
 After rebuilding, reload the extension from `chrome://extensions`, then refresh
 the GitHub tab. Use `npm run watch` while developing to rebuild on changes.

@@ -3,11 +3,25 @@
   "name": "GHA++",
   "version": "0.1.0",
   "description": "Improves the GitHub Actions job experience.",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "content_scripts": [
     {
       "matches": ["https://github.com/*"],
       "js": ["dist/content.js"],
       "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "worker-host.html",
+        "dist/worker-host.js",
+        "dist/log-worker.js",
+        "dist/wasm/*"
+      ],
+      "matches": ["https://github.com/*"]
     }
   ]
 }

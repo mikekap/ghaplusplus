@@ -12,6 +12,87 @@
   type NavigationCallback = (navigation: NavigationEvent) => void;
   type WindowWithNavigation = Window & { navigation?: EventTarget };
 
+  interface JobStep {
+    log_url: string;
+    length?: Promise<number>;
+    contentByLine?: Promise<string[]>;
+  }
+
+  interface LogWorkerResponse {
+    type: "result" | "error";
+    lines?: string[];
+    error?: string;
+  }
+
+  interface ChromeRuntime {
+    runtime: { getURL(path: string): string };
+  }
+
+  const extensionChrome = (
+    globalThis as typeof globalThis & { chrome: ChromeRuntime }
+  ).chrome;
+  function contentRange(response: Response): { start: number; total: number } {
+    const header = response.headers.get("content-range");
+    const match = header?.match(/^bytes (\d+)-(\d+)\/(\d+)$/i);
+    if (!match) {
+      return {
+        start: 0,
+        total: Number(response.headers.get("content-length") ?? 0),
+      };
+    }
+
+    return { start: Number(match[1]), total: Number(match[3]) };
+  }
+
+  async function parseLogResponse(response: Response): Promise<string[]> {
+    if (!response.ok) {
+      throw new Error(`Log request failed with HTTP ${response.status}`);
+    }
+    if (!response.body) throw new Error("Log response did not include a body");
+
+    const hostUrl = extensionChrome.runtime.getURL("worker-host.html");
+    const hostOrigin = new URL(hostUrl).origin;
+    const host = document.createElement("iframe");
+    host.hidden = true;
+    host.src = hostUrl;
+
+    const hostReady = new Promise<void>((resolve, reject) => {
+      host.addEventListener("load", () => resolve(), { once: true });
+      host.addEventListener("error", () => {
+        reject(new Error("Unable to load the log parser worker host"));
+      }, { once: true });
+    });
+    document.documentElement.append(host);
+
+    const result = new Promise<string[]>((resolve, reject) => {
+      const handleResult = (event: MessageEvent<LogWorkerResponse>): void => {
+        if (event.source !== host.contentWindow || event.origin !== hostOrigin) return;
+        window.removeEventListener("message", handleResult);
+
+        const message = event.data;
+        if (message.type === "error") {
+          reject(new Error(message.error ?? "Unknown log parser error"));
+        } else {
+          resolve(message.lines ?? []);
+        }
+      };
+      window.addEventListener("message", handleResult);
+    });
+
+    try {
+      await hostReady;
+      const { start } = contentRange(response);
+      host.contentWindow!.postMessage(
+        { stream: response.body, discardFirstLine: start > 0 },
+        hostOrigin,
+        [response.body],
+      );
+      return await result;
+    } finally {
+      host.remove();
+    }
+  }
+
   /**
    * Runs callback once for the initial URL and once for each committed URL
    * transition. GitHub emits more than one event for a soft navigation, so URL
@@ -83,16 +164,20 @@
     const stepsRequest = await fetch(stepsUrl, {
       headers: {"Accept": "application/json"},
     });
-    const steps = await stepsRequest.json();
+    if (!stepsRequest.ok) {
+      throw new Error(`Steps request failed with HTTP ${stepsRequest.status}`);
+    }
+    const steps = await stepsRequest.json() as JobStep[];
 
-    const stepStats = [];
+    const stepResponses: Array<Promise<Response>> = [];
     for (const step of steps) {
-      stepStats.push(fetch(step.log_url, {headers: {"Range": `bytes=-${INITIAL_LOAD_SIZE}-`}}));
+      stepResponses.push(fetch(step.log_url, {
+        headers: {"Range": `bytes=-${INITIAL_LOAD_SIZE}`},
+      }));
     }
     for (let i = 0; i < steps.length; i++) {
-      steps[i].length = stepStats[i].then((s) => parseInt(s.headers.get('content-range')!.split('/')[1]!));
-      // TODO push body directly to a worker running to_html. Said web worker then returns the raw text of each line to render.
-      // steps[i].contentByLine = Promise<[...]>;
+      steps[i].length = stepResponses[i].then((response) => contentRange(response).total);
+      steps[i].contentByLine = stepResponses[i].then(parseLogResponse);
     }
 
     console.info("Steps are", steps);
