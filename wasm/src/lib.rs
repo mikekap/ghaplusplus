@@ -1,3 +1,5 @@
+use std::ops::Index;
+
 use chrono::{DateTime, Utc};
 use js_sys::Array;
 use js_sys::Date;
@@ -120,7 +122,12 @@ impl LogParser {
                 .unwrap_or(("", &text));
 
             let (date, raw_text) = chrono::DateTime::parse_from_rfc3339(raw_date)
-                .map(|x| (x.with_timezone(&Utc), &raw_text[1..]))
+                .map(|x| {
+                    (
+                        x.with_timezone(&Utc),
+                        raw_text.strip_prefix(' ').unwrap_or(&raw_text),
+                    )
+                })
                 .unwrap_or_else(|err| {
                     warn!("Failed to parse {raw_date} as date: {err:?}");
                     (Utc::now(), &text)
