@@ -15,12 +15,16 @@
   interface JobStep {
     log_url: string;
     length?: Promise<number>;
-    contentByLine?: Promise<string[]>;
+    contentByLine?: Promise<LogElement[]>;
   }
+
+  type LogElement =
+    | { Line: [timestampMs: number, html: string] }
+    | { Group: [timestampMs: number, html: string, children: LogElement[]] };
 
   interface LogWorkerResponse {
     type: "result" | "error";
-    lines?: string[];
+    elements?: LogElement[];
     error?: string;
   }
 
@@ -44,7 +48,7 @@
     return { start: Number(match[1]), total: Number(match[3]) };
   }
 
-  async function parseLogResponse(response: Response): Promise<string[]> {
+  async function parseLogResponse(response: Response): Promise<LogElement[]> {
     if (!response.ok) {
       throw new Error(`Log request failed with HTTP ${response.status}`);
     }
@@ -64,7 +68,7 @@
     });
     document.documentElement.append(host);
 
-    const result = new Promise<string[]>((resolve, reject) => {
+    const result = new Promise<LogElement[]>((resolve, reject) => {
       const handleResult = (event: MessageEvent<LogWorkerResponse>): void => {
         if (event.source !== host.contentWindow || event.origin !== hostOrigin) return;
         window.removeEventListener("message", handleResult);
@@ -73,7 +77,7 @@
         if (message.type === "error") {
           reject(new Error(message.error ?? "Unknown log parser error"));
         } else {
-          resolve(message.lines ?? []);
+          resolve(message.elements ?? []);
         }
       };
       window.addEventListener("message", handleResult);

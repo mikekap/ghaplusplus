@@ -43,7 +43,7 @@
                     reject(new Error(message.error ?? "Unknown log parser error"));
                 }
                 else {
-                    resolve(message.lines ?? []);
+                    resolve(message.elements ?? []);
                 }
             };
             window.addEventListener("message", handleResult);

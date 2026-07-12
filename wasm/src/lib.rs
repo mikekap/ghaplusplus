@@ -16,14 +16,15 @@ pub struct LogParser {
 }
 
 #[derive(Debug)]
-struct JSDateTime{
-    pub dt: DateTime<Utc>
+pub struct JSDateTime {
+    pub dt: DateTime<Utc>,
 }
 
 impl Serialize for JSDateTime {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer {
+        S: serde::Serializer,
+    {
         serializer.serialize_i64(self.dt.timestamp_millis())
     }
 }
@@ -60,15 +61,15 @@ impl LogParser {
     /// completed lines in that chunk as escaped, ANSI-formatted HTML.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Array, JsValue> {
         self.push_lines(chunk)
-        .map_err(|x: String| JsValue::from_str(&x))
-        .and_then(lines_to_jsvalue)
+            .map_err(|x: String| JsValue::from_str(&x))
+            .and_then(lines_to_jsvalue)
     }
 
     /// Flushes the final unterminated line after the stream reaches EOF.
     pub fn finish(&mut self) -> Result<Array, JsValue> {
         self.finish_lines()
-                .map_err(|x: String| JsValue::from_str(&x))
-        .and_then(lines_to_jsvalue)
+            .map_err(|x: String| JsValue::from_str(&x))
+            .and_then(lines_to_jsvalue)
     }
 }
 
@@ -114,13 +115,16 @@ impl LogParser {
             let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
             let text = String::from_utf8_lossy(raw_line);
             let sample_date = "2026-05-17T06:15:57.6343206Z";
-            let (raw_date, raw_text) = text.split_at_checked(sample_date.len()).unwrap_or(("", &text));
+            let (raw_date, raw_text) = text
+                .split_at_checked(sample_date.len())
+                .unwrap_or(("", &text));
 
             let (date, raw_text) = chrono::DateTime::parse_from_rfc3339(raw_date)
-            .map(|x| (x.with_timezone(&Utc), &raw_text[1..])).unwrap_or_else(|err| {
-                warn!("Failed to parse {raw_date} as date: {err:?}");
-                (Utc::now(), &text)
-            });
+                .map(|x| (x.with_timezone(&Utc), &raw_text[1..]))
+                .unwrap_or_else(|err| {
+                    warn!("Failed to parse {raw_date} as date: {err:?}");
+                    (Utc::now(), &text)
+                });
 
             let html = ansi_to_html::convert(&raw_text).unwrap_or_else(|err| {
                 warn!("Failed to convert log line to html; using raw line: {raw_text}, {err:?}");
@@ -135,13 +139,16 @@ impl LogParser {
 }
 
 fn lines_to_jsvalue<T>(lines: Vec<T>) -> Result<Array, JsValue>
-where T : Serialize {
+where
+    T: Serialize,
+{
     Ok(serde_wasm_bindgen::to_value(&lines)
         .unwrap_or_else(|err| {
-        error!("Failed to convert to JS: {err:?}");
-        Array::new().into()
+            error!("Failed to convert to JS: {err:?}");
+            Array::new().into()
         })
-        .dyn_into::<Array>().unwrap())
+        .dyn_into::<Array>()
+        .unwrap())
 }
 
 #[wasm_bindgen(start)]
@@ -149,8 +156,10 @@ pub fn init() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer()
-        .with_writer(tracing_subscriber_wasm::MakeConsoleWriter::default()))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(tracing_subscriber_wasm::MakeConsoleWriter::default()),
+        )
         .init();
 }
 

@@ -1,4 +1,4 @@
-import init, { LogParser } from "./wasm/ghaplusplus_wasm.js";
+import init, { LogParser, type LogElement } from "./wasm/ghaplusplus_wasm.js";
 
 interface ParseMessage {
   stream: ReadableStream<Uint8Array>;
@@ -16,18 +16,18 @@ self.addEventListener("message", async (event: MessageEvent<ParseMessage>) => {
     await wasmReady;
     parser = new LogParser(event.data.discardFirstLine);
 
-    const lines: string[] = [];
+    const elements: LogElement[] = [];
     const reader = event.data.stream.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      lines.push(...parser.push(value));
+      elements.push(...parser.push(value));
     }
-    lines.push(...parser.finish());
+    elements.push(...parser.finish());
 
     parser.free();
     parser = null;
-    self.postMessage({ type: "result", lines });
+    self.postMessage({ type: "result", elements });
   } catch (error) {
     parser?.free();
     self.postMessage({
