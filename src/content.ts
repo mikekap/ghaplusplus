@@ -2,6 +2,15 @@
   "use strict";
 
   const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
+  const APP_SELECTOR = "[data-gha-plusplus-app]";
+  const ENABLED_SETTING = "viewerEnabled";
+  const SCROLL_RESTORATION_MIN_HEIGHT = "10000000px";
+  let activeJobLog: { dispose(): void } | null = null;
+  let navigationGeneration = 0;
+  let pageLoadComplete = document.readyState === "complete";
+  let initialLogFetchesComplete = false;
+  let scrollRestorationFloor: HTMLStyleElement | null = null;
+
   interface NavigationEvent {
     url: URL;
     previousUrl: URL | null;
@@ -10,25 +19,20 @@
   type NavigationCallback = (navigation: NavigationEvent) => void;
   type WindowWithNavigation = Window & { navigation?: EventTarget };
 
-  interface JobStep {
-    log_url: string;
-    length?: Promise<number>;
-    getLines?: () => Promise<LogElement[]>;
-  }
-
-  type LogElement =
-    | { Line: [timestampMs: number, html: string] }
-    | { Group: [timestampMs: number, html: string, children: LogElement[]] };
-
   interface ParsedLog {
-    elements: LogElement[];
+    chunks: Array<{ html: string; rows: number; estimatedHeight: number }>;
     length: number;
+    complete: boolean;
+    wrapColumns: number;
   }
 
   interface LogWorkerResponse {
     type: "initialized" | "lines" | "error";
-    elements?: LogElement[];
+    requestId?: number;
+    chunks?: Array<{ html: string; rows: number; estimatedHeight: number }>;
     length?: number;
+    complete?: boolean;
+    wrapColumns?: number;
     error?: string;
   }
 
@@ -36,24 +40,80 @@
     runtime: { getURL(path: string): string };
   }
 
+  interface ChromeStorage {
+    sync: {
+      get(defaults: Record<string, boolean>): Promise<Record<string, boolean>>;
+      set(items: Record<string, boolean>): Promise<void>;
+    };
+    onChanged: {
+      addListener(listener: (changes: Record<string, { newValue?: boolean }>, areaName: string) => void): void;
+    };
+  }
+
+  interface StepLogWorkerHandle {
+    getLines(wrapColumns: number): Promise<ParsedLog>;
+    fetchPrevious(wrapColumns: number): Promise<ParsedLog>;
+    rewrap(wrapColumns: number): Promise<ParsedLog>;
+    dispose(): void;
+  }
+
+  interface GHAPlusPlusRuntime {
+    createStepLogWorker(logUrl: string): Promise<StepLogWorkerHandle>;
+  }
+
+  interface GHAPlusPlusReactApp {
+    mount(
+      container: HTMLElement,
+      stepsUrl: string,
+      onInitialLogsComplete: () => void,
+      onRawLogsUrl: (url: string | null) => void,
+    ): void;
+    unmount(host: HTMLElement): void;
+  }
+
   const extensionChrome = (
-    globalThis as typeof globalThis & { chrome: ChromeRuntime }
+    globalThis as typeof globalThis & { chrome: ChromeRuntime & { storage: ChromeStorage } }
   ).chrome;
-  const APP_SELECTOR = "[data-gha-plusplus-app]";
+  const extensionGlobal = globalThis as typeof globalThis & {
+    GHAPlusPlusRuntime?: GHAPlusPlusRuntime;
+    GHAPlusPlusReactApp?: GHAPlusPlusReactApp;
+  };
+
+  // A content script is injected into each full document, but not for GitHub's
+  // HTML5 navigations. Install this before the page can restore a deep scroll.
+  if (JOB_PATH.test(location.pathname)) {
+    scrollRestorationFloor = document.createElement("style");
+    scrollRestorationFloor.textContent = `html, body { min-height: ${SCROLL_RESTORATION_MIN_HEIGHT} !important; }`;
+    document.documentElement.append(scrollRestorationFloor);
+  }
+
+  function removeScrollRestorationFloor(): void {
+    if (!pageLoadComplete || !initialLogFetchesComplete) return;
+    scrollRestorationFloor?.remove();
+    scrollRestorationFloor = null;
+  }
+
+  window.addEventListener("load", () => {
+    pageLoadComplete = true;
+    removeScrollRestorationFloor();
+  }, { once: true });
 
   /**
    * A persistent parser worker for one log step. The extension-origin iframe
    * is required because GitHub's page cannot construct extension workers.
    */
-  class StepLogWorker {
+  class StepLogWorker implements StepLogWorkerHandle {
     private readonly host: HTMLIFrameElement;
     private readonly hostOrigin: string;
     private readonly ready: Promise<void>;
     private resolveReady!: () => void;
     private rejectReady!: (error: Error) => void;
     private result: Promise<ParsedLog> | null = null;
-    private resolveResult: ((result: ParsedLog) => void) | null = null;
-    private rejectResult: ((error: Error) => void) | null = null;
+    private nextRequestId = 1;
+    private readonly pending = new Map<number, {
+      resolve: (result: ParsedLog) => void;
+      reject: (error: Error) => void;
+    }>();
     private disposed = false;
 
     private constructor(logUrl: string) {
@@ -83,12 +143,24 @@
       return worker;
     }
 
-    getLines(): Promise<LogElement[]> {
-      return this.getResult().then((result) => result.elements);
+    getLines(wrapColumns: number): Promise<ParsedLog> {
+      if (this.disposed) return Promise.reject(new Error("Log parser worker was disposed"));
+      if (this.result) return this.result;
+      this.result = this.request("get-lines", wrapColumns);
+      return this.result;
     }
 
-    getLength(): Promise<number> {
-      return this.getResult().then((result) => result.length);
+    async rewrap(wrapColumns: number): Promise<ParsedLog> {
+      await this.result;
+      if (this.disposed) throw new Error("Log parser worker was disposed");
+      return this.request("rewrap", wrapColumns);
+    }
+
+    async fetchPrevious(wrapColumns: number): Promise<ParsedLog> {
+      await this.result;
+      if (this.disposed) throw new Error("Log parser worker was disposed");
+      this.result = this.request("fetch-previous", wrapColumns);
+      return this.result;
     }
 
     dispose(): void {
@@ -100,21 +172,21 @@
       this.fail(new Error("Log parser worker was disposed"));
     }
 
-    private getResult(): Promise<ParsedLog> {
-      if (this.disposed) {
-        return Promise.reject(new Error("Log parser worker was disposed"));
-      }
-      if (this.result) return this.result;
-
-      this.result = new Promise<ParsedLog>((resolve, reject) => {
-        this.resolveResult = resolve;
-        this.rejectResult = reject;
-        this.post({ type: "get-lines" });
+    private request(type: "get-lines" | "fetch-previous" | "rewrap", wrapColumns: number): Promise<ParsedLog> {
+      const requestId = this.nextRequestId;
+      this.nextRequestId += 1;
+      return new Promise<ParsedLog>((resolve, reject) => {
+        this.pending.set(requestId, { resolve, reject });
+        this.post({ type, requestId, wrapColumns });
       });
-      return this.result;
     }
 
-    private post(message: { type: string; logUrl?: string }): void {
+    private post(message: {
+      type: string;
+      logUrl?: string;
+      requestId?: number;
+      wrapColumns?: number;
+    }): void {
       this.host.contentWindow?.postMessage(message, this.hostOrigin);
     }
 
@@ -125,24 +197,34 @@
       if (message.type === "initialized") {
         this.resolveReady();
       } else if (message.type === "lines") {
-        this.resolveResult?.({
-          elements: message.elements ?? [],
+        const pending = message.requestId === undefined ? null : this.pending.get(message.requestId);
+        pending?.resolve({
+          chunks: message.chunks ?? [],
           length: message.length ?? 0,
+          complete: message.complete ?? false,
+          wrapColumns: message.wrapColumns ?? 0,
         });
-        this.resolveResult = null;
-        this.rejectResult = null;
+        if (message.requestId !== undefined) this.pending.delete(message.requestId);
       } else if (message.type === "error") {
-        this.fail(new Error(message.error ?? "Unknown log parser error"));
+        const error = new Error(message.error ?? "Unknown log parser error");
+        if (message.requestId === undefined) this.fail(error);
+        else {
+          this.pending.get(message.requestId)?.reject(error);
+          this.pending.delete(message.requestId);
+        }
       }
     };
 
     private fail(error: Error): void {
       this.rejectReady(error);
-      this.rejectResult?.(error);
-      this.resolveResult = null;
-      this.rejectResult = null;
+      this.pending.forEach(({ reject }) => reject(error));
+      this.pending.clear();
     }
   }
+
+  extensionGlobal.GHAPlusPlusRuntime = {
+    createStepLogWorker: StepLogWorker.create,
+  };
 
   function waitForElement<T extends Element>(
     selector: string,
@@ -167,18 +249,12 @@
     });
   }
 
-  /**
-   * Runs callback once for the initial URL and once for each committed URL
-   * transition. GitHub emits more than one event for a soft navigation, so URL
-   * delivery is deduplicated independently from the event that detected it.
-   */
   function onNavigation(callback: NavigationCallback): () => void {
     let deliveredUrl: string | null = null;
     let scheduled = false;
 
     const deliver = (): void => {
       scheduled = false;
-
       const nextUrl = location.href;
       if (nextUrl === deliveredUrl) return;
 
@@ -186,9 +262,6 @@
       deliveredUrl = nextUrl;
       callback({ url: new URL(nextUrl), previousUrl });
     };
-
-    // Coalesce history, Turbo, Navigation API, and DOM signals generated by a
-    // single GitHub navigation into one callback at the next rendered frame.
     const schedule = (): void => {
       if (scheduled || location.href === deliveredUrl) return;
       scheduled = true;
@@ -199,190 +272,143 @@
       }
     };
 
-    const eventNames = [
-      "turbo:load",
-      "turbo:render",
-      "pjax:end",
-      "popstate",
-      "hashchange",
-    ];
-
-    for (const eventName of eventNames) {
-      window.addEventListener(eventName, schedule, true);
-    }
-
+    const eventNames = ["turbo:load", "turbo:render", "pjax:end", "popstate", "hashchange"];
+    eventNames.forEach((eventName) => window.addEventListener(eventName, schedule, true));
     const navigation = (window as WindowWithNavigation).navigation;
     navigation?.addEventListener("navigatesuccess", schedule);
-
-    // Fallback for GitHub navigation mechanisms that do not emit a public
-    // event. Mutations only trigger a URL comparison; callback remains deduped.
     const observer = new MutationObserver(schedule);
     observer.observe(document, { childList: true, subtree: true });
-
     schedule();
 
     return (): void => {
       observer.disconnect();
-      for (const eventName of eventNames) {
-        window.removeEventListener(eventName, schedule, true);
-      }
+      eventNames.forEach((eventName) => window.removeEventListener(eventName, schedule, true));
       navigation?.removeEventListener("navigatesuccess", schedule);
     };
   }
 
-  function JobLogApp({ stepsUrl }: { stepsUrl: string }) {
-    type State =
-      | { status: "loading" }
-      | { status: "ready"; steps: JobStep[] }
-      | { status: "error"; message: string };
-
-    const [state, setState] = React.useState<State>({ status: "loading" });
-
-    React.useEffect(() => {
-      let cancelled = false;
-      const workers = new Set<StepLogWorker>();
-
-      async function loadSteps(): Promise<void> {
-        setState({ status: "loading" });
-
-        const stepsRequest = await fetch(stepsUrl, {
-          headers: { "Accept": "application/json" },
-        });
-        if (!stepsRequest.ok) {
-          throw new Error(`Steps request failed with HTTP ${stepsRequest.status}`);
-        }
-        const rawSteps = await stepsRequest.json() as JobStep[];
-        const steps = await Promise.all(rawSteps.map(async (step) => {
-          const logUrl = new URL(step.log_url, location.origin).href;
-          const worker = await StepLogWorker.create(logUrl);
-          if (cancelled) {
-            worker.dispose();
-            throw new Error("Job log app was unmounted");
-          }
-          workers.add(worker);
-
-          // Keep the current eager behavior, while exposing getLines for the
-          // component that will eventually render an individual step.
-          const getLines = worker.getLines.bind(worker);
-          const initialLines = getLines();
-          return {
-            ...step,
-            getLines: () => initialLines,
-            length: worker.getLength(),
-          };
-        }));
-
-        console.info("Steps are", steps);
-        if (!cancelled) setState({ status: "ready", steps });
-      }
-
-      loadSteps().catch((error: unknown) => {
-        if (cancelled) return;
-        setState({
-          status: "error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      });
-
-      return () => {
-        cancelled = true;
-        workers.forEach((worker) => worker.dispose());
-      };
-    }, [stepsUrl]);
-
-    const style = React.createElement("style", null, `
-      :host {
-        display: block;
-      }
-      .gha-root {
-        background: var(--bgColor-default, #0d1117);
-        border: 1px solid var(--borderColor-default, #30363d);
-        border-radius: 6px;
-        color: var(--fgColor-default, #e6edf3);
-        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        margin: 8px 0;
-        padding: 12px;
-      }
-      .gha-title {
-        font-weight: 600;
-        margin-bottom: 4px;
-      }
-      .gha-muted {
-        color: var(--fgColor-muted, #8b949e);
-      }
-      .gha-error {
-        color: var(--fgColor-danger, #ff7b72);
-      }
-    `);
-
-    let body: React.ReactNode;
-    if (state.status === "loading") {
-      body = React.createElement("div", { className: "gha-muted" }, "Loading GitHub Actions log data…");
-    } else if (state.status === "error") {
-      body = React.createElement("div", { className: "gha-error" }, state.message);
-    } else {
-      body = React.createElement(
-        "div",
-        { className: "gha-muted" },
-        `Loaded ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}.`,
-      );
-    }
-
-    return React.createElement(
-      React.Fragment,
-      null,
-      style,
-      React.createElement(
-        "div",
-        { className: "gha-root" },
-        React.createElement("div", { className: "gha-title" }, "GHA++"),
-        body,
-      ),
-    );
-  }
-
   function removeMountedApps(): void {
     document.querySelectorAll<HTMLElement>(APP_SELECTOR).forEach((host) => {
-      const mountPoint = host.shadowRoot?.firstElementChild;
-      if (mountPoint instanceof HTMLElement) {
-        ReactDOM.unmountComponentAtNode(mountPoint);
-      }
-      host.remove();
+      extensionGlobal.GHAPlusPlusReactApp?.unmount(host);
     });
   }
 
-  async function mountJobLogApp(): Promise<void> {
+  function disposeActiveJobLog(): void {
+    activeJobLog?.dispose();
+    activeJobLog = null;
+    initialLogFetchesComplete = false;
+  }
+
+  async function viewerEnabled(): Promise<boolean> {
+    const settings = await extensionChrome.storage.sync.get({ [ENABLED_SETTING]: true });
+    return settings[ENABLED_SETTING] ?? true;
+  }
+
+  function replaceNativeLog(
+    search: HTMLElement,
+    logContainer: HTMLElement,
+    stepsUrl: string,
+    onInitialLogsComplete: () => void,
+  ): { dispose(): void } {
+    const nativeLogContents = document.createDocumentFragment();
+    const searchPlaceholder = document.createComment("gha-plusplus-search-placeholder");
+    const actions = document.createElement("div");
+    const timestampsButton = document.createElement("button");
+    const rawLogsButton = document.createElement("button");
+    let rawLogsUrl: string | null = null;
+    let timestampsShown = false;
+
+    nativeLogContents.append(...Array.from(logContainer.childNodes));
+    search.before(searchPlaceholder);
+    actions.className = "gha-plusplus-log-actions";
+    actions.style.cssText = "display: flex; gap: 8px; margin: 0 0 12px;";
+    timestampsButton.className = "Button Button--secondary Button--small";
+    timestampsButton.type = "button";
+    timestampsButton.textContent = "Show timestamps";
+    rawLogsButton.className = "Button Button--secondary Button--small";
+    rawLogsButton.type = "button";
+    rawLogsButton.disabled = true;
+    rawLogsButton.textContent = "View raw logs";
+    actions.append(timestampsButton, rawLogsButton);
+    searchPlaceholder.after(actions);
+    search.remove();
+
+    const toggleTimestamps = (): void => {
+      timestampsShown = !timestampsShown;
+      document.querySelector<HTMLElement>(APP_SELECTOR)?.toggleAttribute(
+        "data-gha-show-timestamps",
+        timestampsShown,
+      );
+      timestampsButton.textContent = timestampsShown ? "Hide timestamps" : "Show timestamps";
+    };
+    const openRawLogs = (): void => {
+      if (rawLogsUrl) window.open(rawLogsUrl, "_blank", "noopener,noreferrer");
+    };
+    timestampsButton.addEventListener("click", toggleTimestamps);
+    rawLogsButton.addEventListener("click", openRawLogs);
+    extensionGlobal.GHAPlusPlusReactApp?.mount(
+      logContainer,
+      stepsUrl,
+      onInitialLogsComplete,
+      (url) => {
+        rawLogsUrl = url;
+        rawLogsButton.disabled = !url;
+      },
+    );
+
+    return {
+      dispose(): void {
+        timestampsButton.removeEventListener("click", toggleTimestamps);
+        rawLogsButton.removeEventListener("click", openRawLogs);
+        removeMountedApps();
+        logContainer.replaceChildren(nativeLogContents);
+        actions.remove();
+        searchPlaceholder.replaceWith(search);
+      },
+    };
+  }
+
+  async function mountJobLogApp(expectedUrl: string, generation: number): Promise<void> {
     const stepsElement = await waitForElement<HTMLElement>("[data-job-steps-url]");
-    const stepsUrl = stepsElement
-      ?.getAttribute("data-job-steps-url");
+    const stepsUrl = stepsElement?.getAttribute("data-job-steps-url");
     if (!stepsUrl) throw new Error("Unable to find GitHub Actions steps URL");
 
-    const container = await waitForElement<HTMLElement>(".js-full-logs-container");
-    if (!container) throw new Error("Unable to find GitHub Actions log container");
+    const [search, logContainer] = await Promise.all([
+      waitForElement<HTMLElement>(".js-check-run-search"),
+      waitForElement<HTMLElement>(".js-full-logs-container"),
+    ]);
+    if (!search) throw new Error("Unable to find GitHub Actions log search");
+    if (!logContainer) throw new Error("Unable to find GitHub Actions log container");
+    if (generation !== navigationGeneration || location.href !== expectedUrl) return;
 
-    removeMountedApps();
-
-    const host = document.createElement("div");
-    host.dataset.ghaPlusplusApp = "";
-    const shadow = host.attachShadow({ mode: "open" });
-    const mountPoint = document.createElement("div");
-    shadow.append(mountPoint);
-    container.append(host);
-
-    ReactDOM.render(
-      React.createElement(JobLogApp, { stepsUrl }),
-      mountPoint,
-    );
+    activeJobLog = replaceNativeLog(search, logContainer, stepsUrl, () => {
+      if (generation !== navigationGeneration || location.href !== expectedUrl) return;
+      initialLogFetchesComplete = true;
+      removeScrollRestorationFloor();
+    });
   }
 
   async function handleNavigation({ url }: NavigationEvent): Promise<void> {
+    const generation = ++navigationGeneration;
+    disposeActiveJobLog();
     if (url.hostname !== "github.com" || !JOB_PATH.test(url.pathname)) {
-      removeMountedApps();
+      scrollRestorationFloor?.remove();
+      scrollRestorationFloor = null;
       return;
     }
-
-    await mountJobLogApp();
+    if (!await viewerEnabled()) {
+      scrollRestorationFloor?.remove();
+      scrollRestorationFloor = null;
+      return;
+    }
+    if (generation !== navigationGeneration || location.href !== url.href) return;
+    await mountJobLogApp(url.href, generation);
+    if (generation !== navigationGeneration || location.href !== url.href) return;
   }
 
   onNavigation(handleNavigation);
+  extensionChrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== "sync" || !(ENABLED_SETTING in changes)) return;
+    void handleNavigation({ url: new URL(location.href), previousUrl: null });
+  });
 })();

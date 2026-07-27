@@ -2,15 +2,17 @@ export default function init(options: {
   module_or_path: URL;
 }): Promise<unknown>;
 
-export type LogElement =
-  | { Line: [timestampMs: number, html: string] }
-  | { Group: [timestampMs: number, html: string, children: LogElement[]] };
-
-export function get_lines(url: string): Promise<unknown>;
+export class LogSession {
+  constructor(url: string);
+  fetch(wrapColumns: number): Promise<unknown>;
+  fetch_previous(wrapColumns: number): Promise<unknown>;
+  rewrap(wrapColumns: number): unknown;
+  free(): void;
+}
 
 export class LogParser {
   constructor(discardFirstLine: boolean);
-  push(chunk: Uint8Array): LogElement[];
-  finish(): LogElement[];
+  push(chunk: Uint8Array): unknown[];
+  finish(): unknown[];
   free(): void;
 }

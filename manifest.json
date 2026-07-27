@@ -3,16 +3,29 @@
   "name": "GHA++",
   "version": "0.1.0",
   "description": "Improves the GitHub Actions job experience.",
+  "permissions": ["storage"],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "GHA++",
+    "default_popup": "popup.html"
+  },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   },
-  "host_permissions": ["https://github.com/*"],
+  "host_permissions": [
+    "https://github.com/*",
+    "https://*.blob.core.windows.net/*"
+  ],
   "content_scripts": [
     {
       "matches": ["https://github.com/*"],
       "js": [
         "dist/vendor/react.js",
         "dist/vendor/react-dom.js",
+        "dist/app.js",
         "dist/content.js"
       ],
       "run_at": "document_start"

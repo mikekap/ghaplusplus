@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GHA++ settings</title>
+    <style>
+      body { color: #1f2328; font: 16px/1.5 system-ui, sans-serif; margin: 40px auto; max-width: 40rem; padding: 0 20px; }
+      label { align-items: center; display: flex; gap: 10px; font-weight: 600; }
+      input { block-size: 18px; inline-size: 18px; }
+      p { color: #59636e; margin: 6px 0 0 28px; }
+      #status { color: #1a7f37; min-height: 1.5em; margin-top: 16px; }
+    </style>
+    <script type="module" src="dist/options.js"></script>
+  </head>
+  <body>
+    <h1>GHA++</h1>
+    <label><input id="viewer-enabled" type="checkbox"> Enable the GHA++ log viewer</label>
+    <p>When disabled, GitHub Actions job pages use GitHub’s built-in log viewer.</p>
+    <div id="status" aria-live="polite"></div>
+  </body>
+</html>

@@ -1,6 +1,8 @@
 type WorkerMessage =
   | { type: "init"; logUrl: string }
-  | { type: "get-lines" }
+  | { type: "get-lines"; requestId: number; wrapColumns: number }
+  | { type: "fetch-previous"; requestId: number; wrapColumns: number }
+  | { type: "rewrap"; requestId: number; wrapColumns: number }
   | { type: "dispose" };
 
 let worker: Worker | null = null;
