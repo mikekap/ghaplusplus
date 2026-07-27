@@ -3,12 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "npm run build:wasm && tsc",
-    "build:wasm": "wasm-pack build wasm --target web --out-dir ../dist/wasm --out-name ghaplusplus_wasm",
+    "build": "npm run build:wasm && npm run build:vendor && tsc",
+    "build:wasm": "wasm-pack build wasm --dev --no-opt --target web --out-dir ../dist/wasm --out-name ghaplusplus_wasm",
+    "build:vendor": "mkdir -p dist/vendor && cp node_modules/react/umd/react.production.min.js dist/vendor/react.js && cp node_modules/react-dom/umd/react-dom.production.min.js dist/vendor/react-dom.js",
     "check": "tsc --noEmit",
     "watch": "tsc --watch"
   },
   "devDependencies": {
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

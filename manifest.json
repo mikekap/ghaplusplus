@@ -6,10 +6,15 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   },
+  "host_permissions": ["https://github.com/*"],
   "content_scripts": [
     {
       "matches": ["https://github.com/*"],
-      "js": ["dist/content.js"],
+      "js": [
+        "dist/vendor/react.js",
+        "dist/vendor/react-dom.js",
+        "dist/content.js"
+      ],
       "run_at": "document_start"
     }
   ],

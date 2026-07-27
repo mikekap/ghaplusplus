@@ -1,30 +1,48 @@
-interface ParseMessage {
-  stream: ReadableStream<Uint8Array>;
-  discardFirstLine: boolean;
+type WorkerMessage =
+  | { type: "init"; logUrl: string }
+  | { type: "get-lines" }
+  | { type: "dispose" };
+
+let worker: Worker | null = null;
+let source: Window | null = null;
+let sourceOrigin: string | null = null;
+
+function reply(message: unknown): void {
+  if (!source || !sourceOrigin) return;
+  source.postMessage(message, sourceOrigin);
 }
 
-function handleParseRequest(event: MessageEvent<ParseMessage>): void {
+function handleWorkerRequest(event: MessageEvent<WorkerMessage>): void {
   if (event.source !== parent || event.origin !== "https://github.com") return;
-  window.removeEventListener("message", handleParseRequest);
+  if (event.data.type === "init") {
+    if (worker) {
+      reply({ type: "error", error: "Log worker is already initialized" });
+      return;
+    }
+    source = event.source as Window;
+    sourceOrigin = event.origin;
+    worker = new Worker(new URL("dist/log-worker.js", location.href), {
+      type: "module",
+    });
+    worker.addEventListener("message", (workerEvent) => reply(workerEvent.data));
+    worker.addEventListener("error", (workerError) => {
+      reply({
+        type: "error",
+        error: workerError.message || "Log parser worker failed",
+      });
+    }, { once: true });
+  }
 
-  const source = event.source as Window;
-  const worker = new Worker(new URL("dist/log-worker.js", location.href), {
-    type: "module",
-  });
+  if (!worker) {
+    reply({ type: "error", error: "Log worker is not initialized" });
+    return;
+  }
 
-  worker.addEventListener("message", (workerEvent) => {
-    source.postMessage(workerEvent.data, event.origin);
+  worker.postMessage(event.data);
+  if (event.data.type === "dispose") {
     worker.terminate();
-  }, { once: true });
-  worker.addEventListener("error", (workerError) => {
-    source.postMessage({
-      type: "error",
-      error: workerError.message || "Log parser worker failed",
-    }, event.origin);
-    worker.terminate();
-  }, { once: true });
-
-  worker.postMessage(event.data, [event.data.stream]);
+    worker = null;
+  }
 }
 
-window.addEventListener("message", handleParseRequest);
+window.addEventListener("message", handleWorkerRequest);

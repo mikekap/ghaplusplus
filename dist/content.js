@@ -2,61 +2,122 @@
 (() => {
     "use strict";
     const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
-    const INITIAL_LOAD_SIZE = 2 * 1024 * 1024;
     const extensionChrome = globalThis.chrome;
-    function contentRange(response) {
-        const header = response.headers.get("content-range");
-        const match = header?.match(/^bytes (\d+)-(\d+)\/(\d+)$/i);
-        if (!match) {
-            return {
-                start: 0,
-                total: Number(response.headers.get("content-length") ?? 0),
-            };
-        }
-        return { start: Number(match[1]), total: Number(match[3]) };
-    }
-    async function parseLogResponse(response) {
-        if (!response.ok) {
-            throw new Error(`Log request failed with HTTP ${response.status}`);
-        }
-        if (!response.body)
-            throw new Error("Log response did not include a body");
-        const hostUrl = extensionChrome.runtime.getURL("worker-host.html");
-        const hostOrigin = new URL(hostUrl).origin;
-        const host = document.createElement("iframe");
-        host.hidden = true;
-        host.src = hostUrl;
-        const hostReady = new Promise((resolve, reject) => {
-            host.addEventListener("load", () => resolve(), { once: true });
-            host.addEventListener("error", () => {
-                reject(new Error("Unable to load the log parser worker host"));
+    const APP_SELECTOR = "[data-gha-plusplus-app]";
+    /**
+     * A persistent parser worker for one log step. The extension-origin iframe
+     * is required because GitHub's page cannot construct extension workers.
+     */
+    class StepLogWorker {
+        host;
+        hostOrigin;
+        ready;
+        resolveReady;
+        rejectReady;
+        result = null;
+        resolveResult = null;
+        rejectResult = null;
+        disposed = false;
+        constructor(logUrl) {
+            const hostUrl = extensionChrome.runtime.getURL("worker-host.html");
+            this.hostOrigin = new URL(hostUrl).origin;
+            this.host = document.createElement("iframe");
+            this.host.hidden = true;
+            this.host.src = hostUrl;
+            this.ready = new Promise((resolve, reject) => {
+                this.resolveReady = resolve;
+                this.rejectReady = reject;
+            });
+            window.addEventListener("message", this.handleMessage);
+            this.host.addEventListener("load", () => {
+                this.post({ type: "init", logUrl });
             }, { once: true });
-        });
-        document.documentElement.append(host);
-        const result = new Promise((resolve, reject) => {
-            const handleResult = (event) => {
-                if (event.source !== host.contentWindow || event.origin !== hostOrigin)
+            this.host.addEventListener("error", () => {
+                this.fail(new Error("Unable to load the log parser worker host"));
+            }, { once: true });
+            document.documentElement.append(this.host);
+        }
+        static async create(logUrl) {
+            const worker = new StepLogWorker(logUrl);
+            await worker.ready;
+            return worker;
+        }
+        getLines() {
+            return this.getResult().then((result) => result.elements);
+        }
+        getLength() {
+            return this.getResult().then((result) => result.length);
+        }
+        dispose() {
+            if (this.disposed)
+                return;
+            this.disposed = true;
+            this.post({ type: "dispose" });
+            this.host.remove();
+            window.removeEventListener("message", this.handleMessage);
+            this.fail(new Error("Log parser worker was disposed"));
+        }
+        getResult() {
+            if (this.disposed) {
+                return Promise.reject(new Error("Log parser worker was disposed"));
+            }
+            if (this.result)
+                return this.result;
+            this.result = new Promise((resolve, reject) => {
+                this.resolveResult = resolve;
+                this.rejectResult = reject;
+                this.post({ type: "get-lines" });
+            });
+            return this.result;
+        }
+        post(message) {
+            this.host.contentWindow?.postMessage(message, this.hostOrigin);
+        }
+        handleMessage = (event) => {
+            if (event.source !== this.host.contentWindow || event.origin !== this.hostOrigin)
+                return;
+            const message = event.data;
+            if (message.type === "initialized") {
+                this.resolveReady();
+            }
+            else if (message.type === "lines") {
+                this.resolveResult?.({
+                    elements: message.elements ?? [],
+                    length: message.length ?? 0,
+                });
+                this.resolveResult = null;
+                this.rejectResult = null;
+            }
+            else if (message.type === "error") {
+                this.fail(new Error(message.error ?? "Unknown log parser error"));
+            }
+        };
+        fail(error) {
+            this.rejectReady(error);
+            this.rejectResult?.(error);
+            this.resolveResult = null;
+            this.rejectResult = null;
+        }
+    }
+    function waitForElement(selector, timeoutMs = 5000) {
+        const existing = document.querySelector(selector);
+        if (existing)
+            return Promise.resolve(existing);
+        return new Promise((resolve) => {
+            const observer = new MutationObserver(() => {
+                const element = document.querySelector(selector);
+                if (!element)
                     return;
-                window.removeEventListener("message", handleResult);
-                const message = event.data;
-                if (message.type === "error") {
-                    reject(new Error(message.error ?? "Unknown log parser error"));
-                }
-                else {
-                    resolve(message.elements ?? []);
-                }
-            };
-            window.addEventListener("message", handleResult);
+                clearTimeout(timeout);
+                observer.disconnect();
+                resolve(element);
+            });
+            const timeout = window.setTimeout(() => {
+                observer.disconnect();
+                resolve(null);
+            }, timeoutMs);
+            observer.observe(document, { childList: true, subtree: true });
         });
-        try {
-            await hostReady;
-            const { start } = contentRange(response);
-            host.contentWindow.postMessage({ stream: response.body, discardFirstLine: start > 0 }, hostOrigin, [response.body]);
-            return await result;
-        }
-        finally {
-            host.remove();
-        }
     }
     /**
      * Runs callback once for the initial URL and once for each committed URL
@@ -113,28 +174,124 @@
             navigation?.removeEventListener("navigatesuccess", schedule);
         };
     }
-    async function handleNavigation({ url }) {
-        if (url.hostname !== "github.com" || !JOB_PATH.test(url.pathname))
-            return;
-        const stepsUrl = document.querySelector('[data-job-steps-url]').getAttribute("data-job-steps-url");
-        const stepsRequest = await fetch(stepsUrl, {
-            headers: { "Accept": "application/json" },
+    function JobLogApp({ stepsUrl }) {
+        const [state, setState] = React.useState({ status: "loading" });
+        React.useEffect(() => {
+            let cancelled = false;
+            const workers = new Set();
+            async function loadSteps() {
+                setState({ status: "loading" });
+                const stepsRequest = await fetch(stepsUrl, {
+                    headers: { "Accept": "application/json" },
+                });
+                if (!stepsRequest.ok) {
+                    throw new Error(`Steps request failed with HTTP ${stepsRequest.status}`);
+                }
+                const rawSteps = await stepsRequest.json();
+                const steps = await Promise.all(rawSteps.map(async (step) => {
+                    const logUrl = new URL(step.log_url, location.origin).href;
+                    const worker = await StepLogWorker.create(logUrl);
+                    if (cancelled) {
+                        worker.dispose();
+                        throw new Error("Job log app was unmounted");
+                    }
+                    workers.add(worker);
+                    // Keep the current eager behavior, while exposing getLines for the
+                    // component that will eventually render an individual step.
+                    const getLines = worker.getLines.bind(worker);
+                    const initialLines = getLines();
+                    return {
+                        ...step,
+                        getLines: () => initialLines,
+                        length: worker.getLength(),
+                    };
+                }));
+                console.info("Steps are", steps);
+                if (!cancelled)
+                    setState({ status: "ready", steps });
+            }
+            loadSteps().catch((error) => {
+                if (cancelled)
+                    return;
+                setState({
+                    status: "error",
+                    message: error instanceof Error ? error.message : String(error),
+                });
+            });
+            return () => {
+                cancelled = true;
+                workers.forEach((worker) => worker.dispose());
+            };
+        }, [stepsUrl]);
+        const style = React.createElement("style", null, `
+      :host {
+        display: block;
+      }
+      .gha-root {
+        background: var(--bgColor-default, #0d1117);
+        border: 1px solid var(--borderColor-default, #30363d);
+        border-radius: 6px;
+        color: var(--fgColor-default, #e6edf3);
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 8px 0;
+        padding: 12px;
+      }
+      .gha-title {
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .gha-muted {
+        color: var(--fgColor-muted, #8b949e);
+      }
+      .gha-error {
+        color: var(--fgColor-danger, #ff7b72);
+      }
+    `);
+        let body;
+        if (state.status === "loading") {
+            body = React.createElement("div", { className: "gha-muted" }, "Loading GitHub Actions log data…");
+        }
+        else if (state.status === "error") {
+            body = React.createElement("div", { className: "gha-error" }, state.message);
+        }
+        else {
+            body = React.createElement("div", { className: "gha-muted" }, `Loaded ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}.`);
+        }
+        return React.createElement(React.Fragment, null, style, React.createElement("div", { className: "gha-root" }, React.createElement("div", { className: "gha-title" }, "GHA++"), body));
+    }
+    function removeMountedApps() {
+        document.querySelectorAll(APP_SELECTOR).forEach((host) => {
+            const mountPoint = host.shadowRoot?.firstElementChild;
+            if (mountPoint instanceof HTMLElement) {
+                ReactDOM.unmountComponentAtNode(mountPoint);
+            }
+            host.remove();
         });
-        if (!stepsRequest.ok) {
-            throw new Error(`Steps request failed with HTTP ${stepsRequest.status}`);
+    }
+    async function mountJobLogApp() {
+        const stepsElement = await waitForElement("[data-job-steps-url]");
+        const stepsUrl = stepsElement
+            ?.getAttribute("data-job-steps-url");
+        if (!stepsUrl)
+            throw new Error("Unable to find GitHub Actions steps URL");
+        const container = await waitForElement(".js-full-logs-container");
+        if (!container)
+            throw new Error("Unable to find GitHub Actions log container");
+        removeMountedApps();
+        const host = document.createElement("div");
+        host.dataset.ghaPlusplusApp = "";
+        const shadow = host.attachShadow({ mode: "open" });
+        const mountPoint = document.createElement("div");
+        shadow.append(mountPoint);
+        container.append(host);
+        ReactDOM.render(React.createElement(JobLogApp, { stepsUrl }), mountPoint);
+    }
+    async function handleNavigation({ url }) {
+        if (url.hostname !== "github.com" || !JOB_PATH.test(url.pathname)) {
+            removeMountedApps();
+            return;
         }
-        const steps = await stepsRequest.json();
-        const stepResponses = [];
-        for (const step of steps) {
-            stepResponses.push(fetch(step.log_url, {
-                headers: { "Range": `bytes=-${INITIAL_LOAD_SIZE}` },
-            }));
-        }
-        for (let i = 0; i < steps.length; i++) {
-            steps[i].length = stepResponses[i].then((response) => contentRange(response).total);
-            steps[i].contentByLine = stepResponses[i].then(parseLogResponse);
-        }
-        console.info("Steps are", steps);
+        await mountJobLogApp();
     }
     onNavigation(handleNavigation);
 })();
