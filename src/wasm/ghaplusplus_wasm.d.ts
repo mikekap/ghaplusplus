@@ -2,11 +2,19 @@ export default function init(options: {
   module_or_path: URL;
 }): Promise<unknown>;
 
-export class LogSession {
+export class LogSource {
   constructor(url: string);
-  fetch(wrapColumns: number): Promise<unknown>;
-  fetch_previous(wrapColumns: number): Promise<unknown>;
-  rewrap(wrapColumns: number): unknown;
+  create_view(wrapColumns: number): LogView;
+  fetch(): Promise<void>;
+  fetch_previous(): Promise<void>;
+  free(): void;
+}
+
+export class LogView {
+  private constructor();
+  initialize_window(): unknown;
+  expand_to_source_start(): unknown;
+  set_wrap_columns(wrapColumns: number): unknown;
   free(): void;
 }
 

@@ -3,7 +3,11 @@ use js_sys::Array;
 #[cfg(target_arch = "wasm32")]
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde::Serialize;
+#[cfg(target_arch = "wasm32")]
+use std::cell::{Cell, RefCell};
 use std::fmt::Write;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 use tracing::error;
 use tracing::warn;
 use tracing_subscriber::prelude::*;
@@ -18,11 +22,21 @@ pub struct LogParser {
 }
 
 #[wasm_bindgen]
-pub struct LogSession {
+pub struct LogSource {
     #[cfg(target_arch = "wasm32")]
     log_url: String,
     #[cfg(target_arch = "wasm32")]
-    fetched: Option<FetchedLogData>,
+    fetched: Rc<RefCell<Option<LogData>>>,
+}
+
+#[wasm_bindgen]
+pub struct LogView {
+    #[cfg(target_arch = "wasm32")]
+    fetched: Rc<RefCell<Option<LogData>>>,
+    #[cfg(target_arch = "wasm32")]
+    start: Cell<Option<u64>>,
+    #[cfg(target_arch = "wasm32")]
+    wrap_columns: Cell<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +73,7 @@ pub enum LogElement {
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Serialize)]
-struct FetchedLog {
+struct RenderedLog {
     chunks: Vec<RenderedChunk>,
     length: u64,
     complete: bool,
@@ -76,11 +90,10 @@ struct RenderedChunk {
 }
 
 #[cfg(target_arch = "wasm32")]
-struct FetchedLogData {
+struct LogData {
     elements: Vec<LogElement>,
     start: u64,
     length: u64,
-    complete: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -126,23 +139,28 @@ impl LogParser {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-impl LogSession {
+impl LogSource {
     #[wasm_bindgen(constructor)]
     pub fn new(log_url: String) -> Self {
         Self {
             log_url,
-            fetched: None,
+            fetched: Rc::new(RefCell::new(None)),
         }
     }
 
-    pub async fn fetch(&mut self, wrap_columns: u32) -> Result<JsValue, JsValue> {
+    pub fn create_view(&self, wrap_columns: u32) -> LogView {
+        LogView {
+            fetched: Rc::clone(&self.fetched),
+            start: Cell::new(None),
+            wrap_columns: Cell::new(wrap_columns.max(40)),
+        }
+    }
+
+    pub async fn fetch(&self) -> Result<(), JsValue> {
         // Azure's Actions log endpoint does not reliably honor suffix ranges.
         // Probe from byte zero for the total length, then fetch an explicit tail.
-        let (front_range, front_bytes) = fetch_log_range(
-            &self.log_url,
-            format!("bytes=0-{}", LOG_RANGE_BYTES - 1),
-        )
-        .await?;
+        let (front_range, front_bytes) =
+            fetch_log_range(&self.log_url, format!("bytes=0-{}", LOG_RANGE_BYTES - 1)).await?;
         let length = if front_range.length == 0 {
             front_bytes.len() as u64
         } else {
@@ -153,11 +171,17 @@ impl LogSession {
             (front_range, front_bytes)
         } else {
             if length == 0 {
-                return Err(JsValue::from_str("Log range response did not provide a total length"));
+                return Err(JsValue::from_str(
+                    "Log range response did not provide a total length",
+                ));
             }
             fetch_log_range(
                 &self.log_url,
-                format!("bytes={}-{}", length.saturating_sub(LOG_RANGE_BYTES), length - 1),
+                format!(
+                    "bytes={}-{}",
+                    length.saturating_sub(LOG_RANGE_BYTES),
+                    length - 1
+                ),
             )
             .await?
         };
@@ -165,58 +189,96 @@ impl LogSession {
         let mut elements = parser
             .push_lines(&bytes)
             .map_err(|error| JsValue::from_str(&error))?;
-        elements.extend(parser.finish_lines().map_err(|error| JsValue::from_str(&error))?);
-        self.fetched = Some(FetchedLogData {
+        elements.extend(
+            parser
+                .finish_lines()
+                .map_err(|error| JsValue::from_str(&error))?,
+        );
+        *self.fetched.borrow_mut() = Some(LogData {
             elements,
             start: range.start,
             length,
-            complete: range.complete,
         });
-        self.render(wrap_columns)
+        Ok(())
     }
 
-    pub async fn fetch_previous(&mut self, wrap_columns: u32) -> Result<JsValue, JsValue> {
+    pub async fn fetch_previous(&self) -> Result<(), JsValue> {
         let current_start = self
             .fetched
+            .borrow()
             .as_ref()
-            .ok_or_else(|| JsValue::from_str("Log session has not fetched a range"))?
+            .ok_or_else(|| JsValue::from_str("Log source has not fetched a range"))?
             .start;
         if current_start == 0 {
-            return self.render(wrap_columns);
+            return Ok(());
         }
 
         let range_end = current_start - 1;
         let range_start = range_end.saturating_sub(LOG_RANGE_BYTES - 1);
-        let (range, bytes) = fetch_log_range(&self.log_url, format!("bytes={range_start}-{range_end}")).await?;
+        let (range, bytes) =
+            fetch_log_range(&self.log_url, format!("bytes={range_start}-{range_end}")).await?;
         let mut parser = LogParser::with_offset(range.start > 0, range.start);
         // The final bytes continue the partial line discarded from the current
         // range, so do not flush this parser's trailing line.
         let elements = parser
             .push_lines(&bytes)
             .map_err(|error| JsValue::from_str(&error))?;
-        let fetched = self.fetched.as_mut().expect("checked above");
+        let mut fetched_ref = self.fetched.borrow_mut();
+        let fetched = fetched_ref.as_mut().expect("checked above");
         fetched.elements.splice(0..0, elements);
         fetched.start = range.start;
         if range.length != 0 {
             fetched.length = range.length;
         }
-        fetched.complete = range.start == 0;
-        self.render(wrap_columns)
+        Ok(())
     }
+}
 
-    pub fn rewrap(&self, wrap_columns: u32) -> Result<JsValue, JsValue> {
-        if self.fetched.is_none() {
-            return Err(JsValue::from_str("Log session has not fetched a range"));
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+impl LogView {
+    pub fn initialize_window(&self) -> Result<JsValue, JsValue> {
+        if self.start.get().is_none() {
+            let fetched = self.fetched.borrow();
+            let start = fetched
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("Log source has not fetched a range"))?
+                .start;
+            self.start.set(Some(start));
         }
-        self.render(wrap_columns)
+        self.render()
     }
 
-    fn render(&self, wrap_columns: u32) -> Result<JsValue, JsValue> {
-        let fetched = self.fetched.as_ref().expect("checked by caller");
-        serde_wasm_bindgen::to_value(&FetchedLog {
-            chunks: render_chunks(&fetched.elements, wrap_columns as usize),
+    pub fn expand_to_source_start(&self) -> Result<JsValue, JsValue> {
+        let fetched = self.fetched.borrow();
+        let start = fetched
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Log source has not fetched a range"))?
+            .start;
+        self.start.set(Some(start));
+        drop(fetched);
+        self.render()
+    }
+
+    pub fn set_wrap_columns(&self, wrap_columns: u32) -> Result<JsValue, JsValue> {
+        self.wrap_columns.set(wrap_columns.max(40));
+        self.render()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LogView {
+    fn render(&self) -> Result<JsValue, JsValue> {
+        let fetched_ref = self.fetched.borrow();
+        let fetched = fetched_ref
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Log source has not fetched a range"))?;
+        let start = self.start.get().unwrap_or(fetched.start);
+        let wrap_columns = self.wrap_columns.get();
+        serde_wasm_bindgen::to_value(&RenderedLog {
+            chunks: render_chunks_from(&fetched.elements, start, wrap_columns as usize),
             length: fetched.length,
-            complete: fetched.complete,
+            complete: start == 0,
             wrap_columns,
         })
         .map_err(|error| JsValue::from_str(&format!("Failed to serialize rendered log: {error}")))
@@ -224,7 +286,10 @@ impl LogSession {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn fetch_log_range(log_url: &str, range_value: String) -> Result<(ContentRange, Vec<u8>), JsValue> {
+async fn fetch_log_range(
+    log_url: &str,
+    range_value: String,
+) -> Result<(ContentRange, Vec<u8>), JsValue> {
     let response = reqwest::Client::new()
         .get(log_url)
         .header(RANGE, range_value)
@@ -397,7 +462,16 @@ impl LogParser {
 
 const LOG_CHUNK_ROWS: usize = 200;
 
+#[cfg(test)]
 fn render_chunks(elements: &[LogElement], wrap_columns: usize) -> Vec<RenderedChunk> {
+    render_chunks_from(elements, 0, wrap_columns)
+}
+
+fn render_chunks_from(
+    elements: &[LogElement],
+    start_offset: u64,
+    wrap_columns: usize,
+) -> Vec<RenderedChunk> {
     let mut chunks = Vec::new();
     let mut html = String::new();
     let mut rows = 0;
@@ -409,7 +483,9 @@ fn render_chunks(elements: &[LogElement], wrap_columns: usize) -> Vec<RenderedCh
         let estimated_visual_rows = visible_columns.div_ceil(wrap_columns).max(1);
         let wraps = estimated_visual_rows > 1;
         let timestamp = if timestamp.dt.timestamp_millis() != 0 {
-            timestamp.dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            timestamp
+                .dt
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         } else {
             String::new()
         };
@@ -433,17 +509,21 @@ fn render_chunks(elements: &[LogElement], wrap_columns: usize) -> Vec<RenderedCh
 
     fn visit(
         elements: &[LogElement],
+        start_offset: u64,
         append: &mut impl FnMut(&JSDateTime, &str, u64),
     ) {
         for element in elements {
             match element {
-                LogElement::Line(timestamp, html, byte_offset) => append(timestamp, html, *byte_offset),
-                LogElement::Group(_, _, children) => visit(children, append),
+                LogElement::Line(timestamp, html, byte_offset) if *byte_offset >= start_offset => {
+                    append(timestamp, html, *byte_offset)
+                }
+                LogElement::Line(_, _, _) => {}
+                LogElement::Group(_, _, children) => visit(children, start_offset, append),
             }
         }
     }
 
-    visit(elements, &mut append);
+    visit(elements, start_offset, &mut append);
     if rows != 0 {
         chunks.push(RenderedChunk {
             html,
@@ -516,35 +596,37 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::assert_matches;
-
     #[test]
     fn buffers_partial_lines() {
         let mut parser = LogParser::new(false);
         assert!(parser.push_lines(b"hel").unwrap().is_empty());
 
         let lines = parser.push_lines(b"lo\nworld").unwrap();
-        assert_matches!(lines.as_slice(), [LogElement::Line(_, s, 0)] if s == "hello");
+        assert!(matches!(lines.as_slice(), [LogElement::Line(_, s, 0)] if s == "hello"));
 
         let lines = parser.finish_lines().unwrap();
-        assert_matches!(lines.as_slice(), [LogElement::Line(_, s, 6)] if s == "world");
+        assert!(matches!(lines.as_slice(), [LogElement::Line(_, s, 6)] if s == "world"));
     }
 
     #[test]
     fn discards_a_partial_range_line() {
         let mut parser = LogParser::with_offset(true, 100);
         let lines = parser.push_lines(b"partial\n\x1b[31mred\x1b[0m\n").unwrap();
-        assert_matches!(lines.as_slice(), [LogElement::Line(_, s, 108)] if s.contains("red"));
+        assert!(matches!(lines.as_slice(), [LogElement::Line(_, s, 108)] if s.contains("red")));
         assert!(parser.finish_lines().unwrap().is_empty());
     }
 
     #[test]
     fn parses_bom_prefixed_timestamp() {
         let LogElement::Line(ts, text, byte_offset) =
-            LogParser::parse_line("\u{feff}2026-05-17T06:16:09.07823Z   hello", 42) else {
-                panic!("Nope");
-            };
-        assert_eq!(Into::<DateTime<Utc>>::into(ts).timestamp_millis(), 1_778_998_569_078);
+            LogParser::parse_line("\u{feff}2026-05-17T06:16:09.07823Z   hello", 42)
+        else {
+            panic!("Nope");
+        };
+        assert_eq!(
+            Into::<DateTime<Utc>>::into(ts).timestamp_millis(),
+            1_778_998_569_078
+        );
         assert_eq!(text, "  hello");
         assert_eq!(byte_offset, 42);
     }
@@ -552,9 +634,10 @@ mod tests {
     #[test]
     fn keeps_non_timestamped_output_without_logging() {
         let LogElement::Line(timestamp, text, byte_offset) =
-            LogParser::parse_line("plain output", 7) else {
-                panic!("Nope");
-            };
+            LogParser::parse_line("plain output", 7)
+        else {
+            panic!("Nope");
+        };
         assert_eq!(Into::<DateTime<Utc>>::into(timestamp).timestamp_millis(), 0);
         assert_eq!(text, "plain output");
         assert_eq!(byte_offset, 7);
@@ -581,5 +664,19 @@ mod tests {
         assert_eq!(chunks[0].estimated_height, 36);
         assert!(chunks[0].html.contains("data-offset=\"B99\""));
         assert!(chunks[0].html.contains("gha-log-line--wrap"));
+    }
+
+    #[test]
+    fn renders_only_the_view_window() {
+        let timestamp = JSDateTime::from(DateTime::from_timestamp_millis(1).unwrap());
+        let lines = vec![
+            LogElement::Line(timestamp.clone(), "old".into(), 10),
+            LogElement::Line(timestamp, "current".into(), 20),
+        ];
+
+        let chunks = render_chunks_from(&lines, 20, 80);
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].html.contains("old"));
+        assert!(chunks[0].html.contains("current"));
     }
 }

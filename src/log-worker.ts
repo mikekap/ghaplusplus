@@ -1,124 +1,134 @@
-import init, { LogSession } from "./wasm/ghaplusplus_wasm.js";
-
-type WorkerMessage =
-  | { type: "init"; logUrl: string }
-  | { type: "get-lines"; requestId: number; wrapColumns: number }
-  | { type: "fetch-previous"; requestId: number; wrapColumns: number }
-  | { type: "rewrap"; requestId: number; wrapColumns: number }
-  | { type: "dispose" };
-
-interface ParsedLog {
-  chunks: Array<{ html: string; rows: number; estimatedHeight: number }>;
-  length: number;
-  complete: boolean;
-  wrapColumns: number;
-}
+import init, { LogSource, LogView } from "./wasm/ghaplusplus_wasm.js";
 
 const wasmReady = init({
   module_or_path: new URL("./wasm/ghaplusplus_wasm_bg.wasm", import.meta.url),
 });
 
-let logUrl: string | null = null;
-let session: LogSession | null = null;
-let result: Promise<ParsedLog> | null = null;
-async function fetchLines(url: string, wrapColumns: number): Promise<ParsedLog> {
-  await wasmReady;
-  session ??= new LogSession(url);
-  return await session.fetch(wrapColumns) as ParsedLog;
+let sourceUrl: string | null = null;
+let sourceReady: Promise<LogSource> | null = null;
+let initialFetch: Promise<void> | null = null;
+let previousFetch: Promise<void> | null = null;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-async function rewrap(wrapColumns: number): Promise<ParsedLog> {
-  await result;
-  if (!session) throw new Error("Log worker has not fetched a range");
-  return session.rewrap(wrapColumns) as ParsedLog;
+function sameChunk(left: RenderedChunk, right: RenderedChunk): boolean {
+  return left.html === right.html
+    && left.rows === right.rows
+    && left.estimatedHeight === right.estimatedHeight;
 }
 
-async function fetchPrevious(wrapColumns: number): Promise<ParsedLog> {
-  await result;
-  if (!session) throw new Error("Log worker has not fetched a range");
-  result = session.fetch_previous(wrapColumns) as Promise<ParsedLog>;
-  return result;
+function changedChunks(previous: RenderedChunk[], next: RenderedChunk[]): RenderSplice {
+  let prefix = 0;
+  while (prefix < previous.length && prefix < next.length && sameChunk(previous[prefix], next[prefix])) {
+    prefix += 1;
+  }
+
+  let suffix = 0;
+  while (
+    suffix < previous.length - prefix
+    && suffix < next.length - prefix
+    && sameChunk(previous[previous.length - suffix - 1], next[next.length - suffix - 1])
+  ) suffix += 1;
+
+  return {
+    index: prefix,
+    deleteCount: previous.length - prefix - suffix,
+    chunks: next.slice(prefix, next.length - suffix),
+  };
 }
 
-self.addEventListener("message", (event: MessageEvent<WorkerMessage>) => {
+function getSource(logUrl: string): Promise<LogSource> {
+  if (sourceUrl && sourceUrl !== logUrl) {
+    return Promise.reject(new Error("Log worker cannot serve multiple log sources"));
+  }
+  sourceUrl = logUrl;
+  sourceReady ??= wasmReady.then(() => new LogSource(logUrl));
+  return sourceReady;
+}
+
+function loadSource(source: LogSource): Promise<void> {
+  initialFetch ??= source.fetch();
+  return initialFetch;
+}
+
+function fetchPreviousSource(source: LogSource): Promise<void> {
+  if (previousFetch) return previousFetch;
+  previousFetch = loadSource(source)
+    .then(() => source.fetch_previous())
+    .finally(() => { previousFetch = null; });
+  return previousFetch;
+}
+
+function createView(source: LogSource, port: MessagePort, wrapColumns: number): void {
+  const view: LogView = source.create_view(wrapColumns);
+  let closed = false;
+  let renderTimer: number | undefined;
+  let pendingRender: RenderedLog | null = null;
+  let renderedChunks: RenderedChunk[] = [];
+  let revision = 0;
+
+  const postError = (error: unknown): void => {
+    if (!closed) port.postMessage({ type: "error", message: errorMessage(error) } satisfies LogViewEvent);
+  };
+  const render = (log: unknown): void => {
+    pendingRender = log as RenderedLog;
+    if (renderTimer !== undefined) clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => {
+      renderTimer = undefined;
+      if (closed || !pendingRender) return;
+      const log = pendingRender;
+      pendingRender = null;
+      const splice = changedChunks(renderedChunks, log.chunks);
+      renderedChunks = log.chunks;
+      revision += 1;
+      port.postMessage({
+        type: "render",
+        revision,
+        splice,
+        length: log.length,
+        complete: log.complete,
+        wrapColumns: log.wrapColumns,
+      } satisfies LogViewEvent);
+    }, 8);
+  };
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    if (renderTimer !== undefined) clearTimeout(renderTimer);
+    port.onmessage = null;
+    port.removeEventListener("close", close);
+    view.free();
+  };
+
+  port.onmessage = (event: MessageEvent<LogViewCommand>): void => {
+    const command = event.data;
+    if (command.type === "load") {
+      void loadSource(source).then(() => view.initialize_window()).then(render, postError);
+    } else if (command.type === "fetch-previous") {
+      void fetchPreviousSource(source).then(() => view.expand_to_source_start()).then(render, postError);
+    } else if (command.type === "set-wrap-columns") {
+      try {
+        render(view.set_wrap_columns(command.wrapColumns));
+      } catch (error) {
+        postError(error);
+      }
+    }
+  };
+  port.addEventListener("close", close);
+  port.start();
+}
+
+self.addEventListener("message", (event: MessageEvent<CreateLogViewMessage>) => {
   const message = event.data;
-  if (message.type === "init") {
-    if (logUrl) {
-      self.postMessage({ type: "error", error: "Log worker is already initialized" });
-      return;
-    }
-    logUrl = message.logUrl;
-    wasmReady.then(
-      () => self.postMessage({ type: "initialized" }),
-      (error: unknown) => self.postMessage({
-        type: "error",
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-    return;
-  }
-
-  if (message.type === "get-lines") {
-    if (!logUrl) {
-      self.postMessage({ type: "error", error: "Log worker is not initialized" });
-      return;
-    }
-    result ??= fetchLines(logUrl, message.wrapColumns);
-    result.then(
-      ({ chunks, length, complete, wrapColumns }) => self.postMessage({
-        type: "lines",
-        requestId: message.requestId,
-        chunks,
-        length,
-        complete,
-        wrapColumns,
-      }),
-      (error: unknown) => self.postMessage({
-        type: "error",
-        requestId: message.requestId,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-    return;
-  }
-
-  if (message.type === "rewrap") {
-    rewrap(message.wrapColumns).then(
-      ({ chunks, length, complete, wrapColumns }) => self.postMessage({
-        type: "lines",
-        requestId: message.requestId,
-        chunks,
-        length,
-        complete,
-        wrapColumns,
-      }),
-      (error: unknown) => self.postMessage({
-        type: "error",
-        requestId: message.requestId,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-    return;
-  }
-
-  if (message.type === "fetch-previous") {
-    fetchPrevious(message.wrapColumns).then(
-      ({ chunks, length, complete, wrapColumns }) => self.postMessage({
-        type: "lines",
-        requestId: message.requestId,
-        chunks,
-        length,
-        complete,
-        wrapColumns,
-      }),
-      (error: unknown) => self.postMessage({
-        type: "error",
-        requestId: message.requestId,
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-    return;
-  }
-
-  self.close();
+  const port = event.ports[0];
+  if (!port) return;
+  void getSource(message.logUrl).then(
+    (source) => createView(source, port, message.wrapColumns),
+    (error: unknown) => {
+      port.postMessage({ type: "error", message: errorMessage(error) } satisfies LogViewEvent);
+      port.close();
+    },
+  );
 });
