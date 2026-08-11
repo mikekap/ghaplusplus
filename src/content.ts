@@ -2,44 +2,24 @@
   "use strict";
 
   const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
-  const APP_SELECTOR = "[data-gha-plusplus-app]";
   const ENABLED_SETTING = "viewerEnabled";
-  let activeJobLog: { dispose(): void } | null = null;
+  let activeHost: HTMLElement | null = null;
   let navigationGeneration = 0;
 
-  interface NavigationEvent {
-    url: URL;
-    previousUrl: URL | null;
-  }
-
-  type NavigationCallback = (navigation: NavigationEvent) => void;
+  type NavigationCallback = (url: URL) => Promise<void>;
   type WindowWithNavigation = Window & { navigation?: EventTarget };
 
-  interface ChromeStorage {
-    sync: {
-      get(defaults: Record<string, boolean>): Promise<Record<string, boolean>>;
-      set(items: Record<string, boolean>): Promise<void>;
-    };
-    onChanged: {
-      addListener(listener: (changes: Record<string, { newValue?: boolean }>, areaName: string) => void): void;
-    };
-  }
-
-  interface GHAPlusPlusReactApp {
-    mount(
-      search: HTMLElement,
-      logContainer: HTMLElement,
-      stepsUrl: string,
-    ): void;
-    unmount(host: HTMLElement): void;
-  }
-
   const extensionChrome = (
-    globalThis as typeof globalThis & { chrome: { storage: ChromeStorage } }
+    globalThis as typeof globalThis & { chrome: ExtensionChrome }
   ).chrome;
   const extensionGlobal = globalThis as typeof globalThis & {
     GHAPlusPlusReactApp?: GHAPlusPlusReactApp;
   };
+
+  function currentNavigationHref(): string {
+    const hashIndex = location.href.indexOf("#");
+    return hashIndex < 0 ? location.href : location.href.slice(0, hashIndex);
+  }
 
   function waitForElement<T extends Element>(
     selector: string,
@@ -64,21 +44,21 @@
     });
   }
 
-  function onNavigation(callback: NavigationCallback): () => void {
+  function onNavigation(callback: NavigationCallback): void {
     let deliveredUrl: string | null = null;
     let scheduled = false;
 
     const deliver = (): void => {
       scheduled = false;
-      const nextUrl = location.href;
+      const url = new URL(currentNavigationHref());
+      const nextUrl = url.href;
       if (nextUrl === deliveredUrl) return;
 
-      const previousUrl = deliveredUrl ? new URL(deliveredUrl) : null;
       deliveredUrl = nextUrl;
-      callback({ url: new URL(nextUrl), previousUrl });
+      void callback(url).catch((error: unknown) => console.error("GHA++ navigation failed", error));
     };
     const schedule = (): void => {
-      if (scheduled || location.href === deliveredUrl) return;
+      if (scheduled || currentNavigationHref() === deliveredUrl) return;
       scheduled = true;
       if (document.readyState === "loading") {
         document.addEventListener("DOMContentLoaded", deliver, { once: true });
@@ -87,30 +67,19 @@
       }
     };
 
-    const eventNames = ["turbo:load", "turbo:render", "pjax:end", "popstate", "hashchange"];
+    const eventNames = ["turbo:load", "turbo:render", "pjax:end", "popstate"];
     eventNames.forEach((eventName) => window.addEventListener(eventName, schedule, true));
     const navigation = (window as WindowWithNavigation).navigation;
     navigation?.addEventListener("navigatesuccess", schedule);
     const observer = new MutationObserver(schedule);
     observer.observe(document, { childList: true, subtree: true });
     schedule();
-
-    return (): void => {
-      observer.disconnect();
-      eventNames.forEach((eventName) => window.removeEventListener(eventName, schedule, true));
-      navigation?.removeEventListener("navigatesuccess", schedule);
-    };
-  }
-
-  function removeMountedApps(): void {
-    document.querySelectorAll<HTMLElement>(APP_SELECTOR).forEach((host) => {
-      extensionGlobal.GHAPlusPlusReactApp?.unmount(host);
-    });
   }
 
   function disposeActiveJobLog(): void {
-    activeJobLog?.dispose();
-    activeJobLog = null;
+    if (!activeHost) return;
+    extensionGlobal.GHAPlusPlusReactApp?.unmount(activeHost);
+    activeHost = null;
   }
 
   async function viewerEnabled(): Promise<boolean> {
@@ -119,30 +88,29 @@
   }
 
   async function mountJobLogApp(expectedUrl: string, generation: number): Promise<void> {
-    const stepsElement = await waitForElement<HTMLElement>("[data-job-steps-url]");
-    const stepsUrl = stepsElement?.getAttribute("data-job-steps-url");
-    if (!stepsUrl) throw new Error("Unable to find GitHub Actions steps URL");
-
-    const [search, logContainer] = await Promise.all([
+    const [stepsElement, search, logContainer] = await Promise.all([
+      waitForElement<HTMLElement>("[data-job-steps-url]"),
       waitForElement<HTMLElement>(".js-check-run-search"),
       waitForElement<HTMLElement>(".js-full-logs-container"),
     ]);
+    const stepsUrl = stepsElement?.getAttribute("data-job-steps-url");
+    if (!stepsUrl) throw new Error("Unable to find GitHub Actions steps URL");
     if (!search) throw new Error("Unable to find GitHub Actions log search");
     if (!logContainer) throw new Error("Unable to find GitHub Actions log container");
-    if (generation !== navigationGeneration || location.href !== expectedUrl) return;
+    if (generation !== navigationGeneration || currentNavigationHref() !== expectedUrl) return;
 
-    extensionGlobal.GHAPlusPlusReactApp?.mount(search, logContainer, stepsUrl);
-    activeJobLog = { dispose: removeMountedApps };
+    const app = extensionGlobal.GHAPlusPlusReactApp;
+    if (!app) throw new Error("GHA++ React app was not loaded");
+    activeHost = app.mount(search, logContainer, stepsUrl);
   }
 
-  async function handleNavigation({ url }: NavigationEvent): Promise<void> {
+  async function handleNavigation(url: URL): Promise<void> {
     const generation = ++navigationGeneration;
     disposeActiveJobLog();
     if (url.hostname !== "github.com" || !JOB_PATH.test(url.pathname)) return;
     if (!await viewerEnabled()) return;
-    if (generation !== navigationGeneration || location.href !== url.href) return;
+    if (generation !== navigationGeneration || currentNavigationHref() !== url.href) return;
     await mountJobLogApp(url.href, generation);
-    if (generation !== navigationGeneration || location.href !== url.href) return;
   }
 
   onNavigation(handleNavigation);

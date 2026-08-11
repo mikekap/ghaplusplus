@@ -87,7 +87,6 @@ function createView(source: LogSource, port: MessagePort, wrapColumns: number): 
         type: "render",
         revision,
         splice,
-        length: log.length,
         complete: log.complete,
         wrapColumns: log.wrapColumns,
       } satisfies LogViewEvent);

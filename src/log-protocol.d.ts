@@ -6,7 +6,6 @@ interface RenderedChunk {
 
 interface RenderedLog {
   chunks: RenderedChunk[];
-  length: number;
   complete: boolean;
   wrapColumns: number;
 }
@@ -28,28 +27,13 @@ type LogViewCommand =
   | { type: "fetch-previous" }
   | { type: "set-wrap-columns"; wrapColumns: number };
 
-/** Incremental update sent from a worker LogView to its React callback. */
+/** Incremental update sent from a worker LogView to its client. */
 type LogViewEvent =
   | {
     type: "render";
     revision: number;
     splice: RenderSplice;
-    length: number;
     complete: boolean;
     wrapColumns: number;
   }
   | { type: "error"; message: string };
-
-interface StepLogViewHandle {
-  load(): Promise<void>;
-  fetchPrevious(): void;
-  setWrapColumns(wrapColumns: number): void;
-  close(): void;
-}
-
-interface StepLogSourceHandle {
-  createView(
-    wrapColumns: number,
-    listener: (event: LogViewEvent) => void,
-  ): Promise<StepLogViewHandle>;
-}

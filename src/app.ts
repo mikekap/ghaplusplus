@@ -13,24 +13,11 @@
     logView?: LogViewClient;
   }
 
-  interface ChromeRuntime {
-    runtime: { getURL(path: string): string };
-  }
-
-  interface GHAPlusPlusReactApp {
-    mount(
-      search: HTMLElement,
-      logContainer: HTMLElement,
-      stepsUrl: string,
-    ): void;
-    unmount(host: HTMLElement): void;
-  }
-
   type ExtensionGlobal = typeof globalThis & {
     GHAPlusPlusReactApp?: GHAPlusPlusReactApp;
   };
   const extensionChrome = (
-    globalThis as typeof globalThis & { chrome: ChromeRuntime }
+    globalThis as typeof globalThis & { chrome: ExtensionChrome }
   ).chrome;
   const extensionGlobal = globalThis as ExtensionGlobal;
   const resizeObservers = new WeakMap<HTMLElement, ResizeObserver>();
@@ -38,6 +25,46 @@
   const scrollRestorationFloors = new WeakMap<HTMLElement, HTMLStyleElement>();
   const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
   const SCROLL_RESTORATION_MIN_HEIGHT = "10000000px";
+  const WORKER_HOST_URL = extensionChrome.runtime.getURL("worker-host.html");
+  const WORKER_HOST_ORIGIN = new URL(WORKER_HOST_URL).origin;
+  const APP_STYLES = `
+    :host { display: block; }
+    .gha-root { background: var(--bgColor-default, #0d1117); border: 1px solid var(--borderColor-default, #30363d); border-radius: 6px; color: var(--fgColor-default, #e6edf3); font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 8px 0; padding: 12px; }
+    .gha-title { font-weight: 600; margin-bottom: 4px; }
+    .gha-muted { color: var(--fgColor-muted, #8b949e); }
+    .gha-error { color: var(--fgColor-danger, #ff7b72); }
+    .gha-steps { margin-top: 12px; }
+    .gha-step + .gha-step { margin-top: 12px; }
+    .gha-step { border: 1px solid var(--borderColor-muted, #21262d); border-radius: 6px; overflow: clip; scroll-margin-top: var(--gha-step-sticky-top, 0px); }
+    .gha-step-title { align-items: center; background: var(--bgColor-muted, #161b22); border-bottom: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; display: flex; position: sticky; top: var(--gha-step-sticky-top, 0px); width: 100%; z-index: 1; }
+    .gha-step-toggle { appearance: none; background: none; border: 0; color: inherit; cursor: pointer; flex: 1; font: inherit; font-weight: 600; min-width: 0; padding: 8px 10px; text-align: left; }
+    .gha-step-static { font-weight: 600; padding: 8px 10px; }
+    .gha-step-navigation { display: flex; gap: 8px; padding-right: 10px; }
+    .gha-step-navigation-link { color: var(--fgColor-accent, #58a6ff); font-size: 14px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+    .gha-step-navigation-link:hover { text-decoration: underline; }
+    .gha-step-navigation-button { appearance: none; background: none; border: 0; cursor: pointer; font: inherit; padding: 0; }
+    .gha-step-navigation-button:disabled { cursor: wait; opacity: 0.65; }
+    .gha-step--no-log { border-style: dashed; opacity: 0.75; }
+    .gha-step--skipped .gha-step-title { position: static; }
+    .gha-step-icon, .gha-step-chevron { color: var(--fgColor-muted, #8b949e); display: inline-block; margin-right: 6px; }
+    .gha-step-chevron { width: 1em; }
+    .gha-step-icon { width: 1.25em; text-align: center; }
+    .gha-step-duration { color: var(--fgColor-muted, #8b949e); font-weight: 400; margin-left: 8px; white-space: nowrap; }
+    .gha-log { background: var(--bgColor-default, #0d1117); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 6px 0; }
+    .gha-log-chunk { content-visibility: auto; }
+    .gha-log-line { display: grid; grid-template-columns: 10ch minmax(0, 1fr); min-height: 18px; }
+    .gha-log-line::before { border-right: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; color: var(--fgColor-muted, #8b949e); overflow: hidden; padding: 0 10px; text-align: right; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
+    .gha-log-timestamp { color: var(--fgColor-muted, #8b949e); display: none; overflow: hidden; padding: 0 10px; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
+    :host([data-gha-show-timestamps]) .gha-log-line { grid-template-columns: 10ch 25ch minmax(0, 1fr); }
+    :host([data-gha-show-timestamps]) .gha-log-timestamp { display: block; }
+    .gha-log--complete { counter-reset: gha-line; }
+    .gha-log--complete .gha-log-line { counter-increment: gha-line; }
+    .gha-log--complete .gha-log-line::before { content: counter(gha-line); }
+    .gha-log--partial .gha-log-line::before { content: attr(data-offset); }
+    .gha-log-content { min-width: 0; padding: 0 10px; tab-size: 4; white-space: pre; }
+    .gha-log-line--wrap .gha-log-content { overflow-wrap: anywhere; white-space: pre-wrap; }
+    .gha-log-status { padding: 10px; }
+  `;
 
   function createScrollRestorationFloor(): HTMLStyleElement {
     const floor = document.createElement("style");
@@ -57,7 +84,7 @@
   }, { once: true });
 
   /** The message-port handle for one worker LogView. */
-  class WorkerLogViewClient implements StepLogViewHandle {
+  class WorkerLogViewClient {
     private closed = false;
     private failed = false;
     private revision = 0;
@@ -88,7 +115,7 @@
       this.post({ type: "set-wrap-columns", wrapColumns });
     }
 
-    reportError(error: unknown): void {
+    private reportError(error: unknown): void {
       this.failed = true;
       const event = {
         type: "error",
@@ -152,25 +179,20 @@
   }
 
   /** A lazily started extension worker that owns one shared fetched log source. */
-  class LogSourceClient implements StepLogSourceHandle {
-    private readonly hostOrigin: string;
-    private host: HTMLIFrameElement | null = null;
+  class LogSourceClient {
     private hostReady: Promise<Window> | null = null;
 
     constructor(
       private readonly logUrl: string,
       private readonly signal: AbortSignal,
-    ) {
-      this.hostOrigin = new URL(extensionChrome.runtime.getURL("worker-host.html")).origin;
-    }
+    ) {}
 
     private ensureHost(): Promise<Window> {
       if (this.hostReady) return this.hostReady;
       const { signal } = this;
       const host = document.createElement("iframe");
-      this.host = host;
       host.hidden = true;
-      host.src = extensionChrome.runtime.getURL("worker-host.html");
+      host.src = WORKER_HOST_URL;
       this.hostReady = new Promise<Window>((resolve, reject) => {
         const cleanupLoad = (): void => {
           host.removeEventListener("load", handleLoad);
@@ -183,7 +205,6 @@
           else {
             signal.removeEventListener("abort", handleAbort);
             host.remove();
-            this.host = null;
             reject(new Error("Log source host has no content window"));
           }
         };
@@ -191,7 +212,6 @@
           cleanupLoad();
           signal.removeEventListener("abort", handleAbort);
           host.remove();
-          this.host = null;
           reject(new Error("Unable to load the log source host"));
         };
         const handleAbort = (): void => {
@@ -221,7 +241,7 @@
             logUrl: this.logUrl,
             wrapColumns,
           } satisfies CreateLogViewMessage,
-          this.hostOrigin,
+          WORKER_HOST_ORIGIN,
           [channel.port1],
         );
         return view;
@@ -270,51 +290,51 @@
     };
   }
 
-  type FetchPriority = "interactive" | "initial" | "background";
+  type LoadPriority = "interactive" | "initial" | "background";
 
-  interface ScheduledLogFetch {
+  interface ScheduledLogLoad {
     load: () => Promise<void>;
-    priority: FetchPriority;
-    initial: boolean;
+    priority: LoadPriority;
+    countsTowardInitial: boolean;
     started: boolean;
   }
 
   /** Bounded queue shared by initial, background, and interactive log work. */
-  class LogFetchPrioritizer {
-    private readonly queues: Record<FetchPriority, ScheduledLogFetch[]> = {
+  class LogLoadPrioritizer {
+    private readonly queues: Record<LoadPriority, ScheduledLogLoad[]> = {
       interactive: [],
       initial: [],
       background: [],
     };
     private active = 0;
     private pendingInitial = 0;
-    private initialBatchClosed = false;
+    private started = false;
     private initialCompletionNotified = false;
 
     constructor(
       private readonly signal: AbortSignal,
+      private readonly onInitialLoadsComplete: () => void,
       private readonly concurrency = 2,
-      private readonly onInitialFetchesComplete: () => void = () => undefined,
     ) {
       signal.addEventListener("abort", this.handleAbort, { once: true });
     }
 
-    scheduleInitial(load: () => Promise<void>): ScheduledLogFetch {
+    scheduleInitial(load: () => Promise<void>): ScheduledLogLoad {
       this.pendingInitial += 1;
       return this.schedule(load, "initial", true);
     }
 
-    scheduleBackground(load: () => Promise<void>): ScheduledLogFetch {
+    scheduleBackground(load: () => Promise<void>): ScheduledLogLoad {
       return this.schedule(load, "background", false);
     }
 
-    closeInitialBatch(): void {
-      this.initialBatchClosed = true;
+    start(): void {
+      this.started = true;
       this.notifyInitialCompletion();
       this.drain();
     }
 
-    promote(task: ScheduledLogFetch): void {
+    promote(task: ScheduledLogLoad): void {
       if (!task.started && task.priority === "background") {
         this.remove(task);
         task.priority = "interactive";
@@ -324,35 +344,36 @@
     }
 
     private readonly handleAbort = (): void => {
-      for (const priority of Object.keys(this.queues) as FetchPriority[]) {
+      for (const priority of Object.keys(this.queues) as LoadPriority[]) {
         this.queues[priority] = [];
       }
     };
 
     private schedule(
       load: () => Promise<void>,
-      priority: FetchPriority,
-      initial: boolean,
-    ): ScheduledLogFetch {
-      const task: ScheduledLogFetch = {
+      priority: LoadPriority,
+      countsTowardInitial: boolean,
+    ): ScheduledLogLoad {
+      const task: ScheduledLogLoad = {
         load,
         priority,
-        initial,
+        countsTowardInitial,
         started: false,
       };
       this.queues[priority].push(task);
       return task;
     }
 
-    private next(): ScheduledLogFetch | undefined {
+    private next(): ScheduledLogLoad | undefined {
       return this.queues.interactive.shift()
         ?? this.queues.initial.shift()
-        ?? (this.initialBatchClosed && this.pendingInitial === 0
+        ?? (this.pendingInitial === 0
           ? this.queues.background.shift()
           : undefined);
     }
 
     private drain(): void {
+      if (!this.started) return;
       while (!this.signal.aborted && this.active < this.concurrency) {
         const task = this.next();
         if (!task) return;
@@ -363,20 +384,20 @@
       }
     }
 
-    private async run(task: ScheduledLogFetch): Promise<void> {
+    private async run(task: ScheduledLogLoad): Promise<void> {
       try {
         await task.load();
       } catch {
         // The view callback reports load errors to React.
       } finally {
         this.active -= 1;
-        if (task.initial) this.pendingInitial -= 1;
+        if (task.countsTowardInitial) this.pendingInitial -= 1;
         this.notifyInitialCompletion();
         this.drain();
       }
     }
 
-    private remove(task: ScheduledLogFetch): void {
+    private remove(task: ScheduledLogLoad): void {
       const queue = this.queues[task.priority];
       const index = queue.indexOf(task);
       if (index >= 0) queue.splice(index, 1);
@@ -385,12 +406,12 @@
     private notifyInitialCompletion(): void {
       if (
         this.signal.aborted
-        || !this.initialBatchClosed
+        || !this.started
         || this.pendingInitial !== 0
         || this.initialCompletionNotified
       ) return;
       this.initialCompletionNotified = true;
-      this.onInitialFetchesComplete();
+      this.onInitialLoadsComplete();
     }
   }
 
@@ -469,11 +490,11 @@
     private workerView: WorkerLogViewClient | null = null;
     private rendered = false;
     private wrapColumns: number;
-    private readonly task: ScheduledLogFetch;
+    private readonly task: ScheduledLogLoad;
 
     constructor(
       private readonly source: LogSourceClient,
-      private readonly prioritizer: LogFetchPrioritizer,
+      private readonly prioritizer: LogLoadPrioritizer,
       initial: boolean,
       private readonly signal: AbortSignal,
       private readonly host: HTMLElement,
@@ -582,7 +603,6 @@
       });
       this.element.insertBefore(fragment, this.element.children.item(splice.index));
       this.element.className = `gha-log ${render.complete ? "gha-log--complete" : "gha-log--partial"}`;
-      this.element.style.counterReset = "";
     }
 
     private reportError(error: unknown): void {
@@ -596,11 +616,9 @@
   function StepLogView({
     step,
     index,
-    onInitialLogRendered,
   }: {
     step: JobStep;
     index: number;
-    onInitialLogRendered?: () => void;
   }) {
     type State =
       | { status: "loading" }
@@ -612,7 +630,6 @@
     const [fetchingPrevious, setFetchingPrevious] = React.useState(false);
     const logContainer = React.useRef<HTMLDivElement>(null);
     const section = React.useRef<HTMLElement>(null);
-    const initialLogRendered = React.useRef(false);
 
     React.useLayoutEffect(() => {
       const view = step.logView;
@@ -635,17 +652,6 @@
     React.useEffect(() => {
       if (!collapsed) step.logView?.prioritize();
     }, [collapsed, step]);
-
-    React.useLayoutEffect(() => {
-      if (
-        onInitialLogRendered
-        && !initialLogRendered.current
-        && (state.status === "ready" || state.status === "error")
-      ) {
-        initialLogRendered.current = true;
-        onInitialLogRendered();
-      }
-    }, [collapsed, onInitialLogRendered, state]);
 
     const title = step.name || `Step ${step.number ?? index + 1}`;
     const duration = stepDuration(step);
@@ -756,14 +762,10 @@
       | { status: "ready"; steps: JobStep[]; rawLogsUrl: string | null }
       | { status: "error"; message: string };
     const [state, setState] = React.useState<State>({ status: "loading" });
-    const [initialFetchesComplete, setInitialFetchesComplete] = React.useState(false);
-    const [initialLogsRendered, setInitialLogsRendered] = React.useState(0);
+    const [initialLoadsComplete, setInitialLoadsComplete] = React.useState(false);
     const [timestampsShown, setTimestampsShown] = React.useState(false);
     const [pageLoadComplete, setPageLoadComplete] = React.useState(document.readyState === "complete");
     const scrollFloorRemoved = React.useRef(false);
-    const reportInitialLogRendered = React.useCallback(() => {
-      setInitialLogsRendered((count) => count + 1);
-    }, []);
 
     React.useEffect(() => {
       if (pageLoadComplete) return undefined;
@@ -773,11 +775,8 @@
     }, [pageLoadComplete]);
 
     React.useLayoutEffect(() => {
-      const initialLogCount = state.status === "ready"
-        ? state.steps.filter((step) => Boolean(step.logView) && !isCollapsedByDefault(step)).length
-        : 0;
       const ready = state.status === "error"
-        || (state.status === "ready" && initialFetchesComplete && initialLogsRendered >= initialLogCount);
+        || (state.status === "ready" && initialLoadsComplete);
       if (!pageLoadComplete || !ready || scrollFloorRemoved.current) return undefined;
       const frame = window.requestAnimationFrame(() => {
         if (scrollFloorRemoved.current) return;
@@ -786,18 +785,15 @@
         scrollRestorationFloors.delete(host);
       });
       return () => window.cancelAnimationFrame(frame);
-    }, [host, initialFetchesComplete, initialLogsRendered, pageLoadComplete, state]);
+    }, [host, initialLoadsComplete, pageLoadComplete, state]);
 
     React.useEffect(() => {
       const controller = new AbortController();
       const { signal } = controller;
-      let initialFetchesReported = false;
-      const reportInitialFetchesComplete = (): void => {
-        if (signal.aborted || initialFetchesReported) return;
-        initialFetchesReported = true;
-        setInitialFetchesComplete(true);
-      };
-      const prioritizer = new LogFetchPrioritizer(signal, 2, reportInitialFetchesComplete);
+      setInitialLoadsComplete(false);
+      const prioritizer = new LogLoadPrioritizer(signal, () => {
+        if (!signal.aborted) setInitialLoadsComplete(true);
+      });
 
       async function loadSteps(): Promise<void> {
         setState({ status: "loading" });
@@ -836,58 +832,18 @@
             ),
           };
         });
-        prioritizer.closeInitialBatch();
+        prioritizer.start();
         setState({ status: "ready", steps, rawLogsUrl });
       }
 
       loadSteps().catch((error: unknown) => {
         if (signal.aborted) return;
         setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
-        reportInitialFetchesComplete();
       });
       return () => {
         controller.abort();
       };
     }, [stepsUrl]);
-
-    const style = React.createElement("style", null, `
-      :host { display: block; }
-      .gha-root { background: var(--bgColor-default, #0d1117); border: 1px solid var(--borderColor-default, #30363d); border-radius: 6px; color: var(--fgColor-default, #e6edf3); font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 8px 0; padding: 12px; }
-      .gha-title { font-weight: 600; margin-bottom: 4px; }
-      .gha-muted { color: var(--fgColor-muted, #8b949e); }
-      .gha-error { color: var(--fgColor-danger, #ff7b72); }
-      .gha-steps { margin-top: 12px; }
-      .gha-step + .gha-step { margin-top: 12px; }
-      .gha-step { border: 1px solid var(--borderColor-muted, #21262d); border-radius: 6px; overflow: clip; scroll-margin-top: var(--gha-step-sticky-top, 0px); }
-      .gha-step-title { align-items: center; background: var(--bgColor-muted, #161b22); border-bottom: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; display: flex; position: sticky; top: var(--gha-step-sticky-top, 0px); width: 100%; z-index: 1; }
-      .gha-step-toggle { appearance: none; background: none; border: 0; color: inherit; cursor: pointer; flex: 1; font: inherit; font-weight: 600; min-width: 0; padding: 8px 10px; text-align: left; }
-      .gha-step-static { font-weight: 600; padding: 8px 10px; }
-      .gha-step-navigation { display: flex; gap: 8px; padding-right: 10px; }
-      .gha-step-navigation-link { color: var(--fgColor-accent, #58a6ff); font-size: 14px; font-weight: 600; text-decoration: none; white-space: nowrap; }
-      .gha-step-navigation-link:hover { text-decoration: underline; }
-      .gha-step-navigation-button { appearance: none; background: none; border: 0; cursor: pointer; font: inherit; padding: 0; }
-      .gha-step-navigation-button:disabled { cursor: wait; opacity: 0.65; }
-      .gha-step--no-log { border-style: dashed; opacity: 0.75; }
-      .gha-step--skipped .gha-step-title { position: static; }
-      .gha-step-icon, .gha-step-chevron { color: var(--fgColor-muted, #8b949e); display: inline-block; margin-right: 6px; }
-      .gha-step-chevron { width: 1em; }
-      .gha-step-icon { width: 1.25em; text-align: center; }
-      .gha-step-duration { color: var(--fgColor-muted, #8b949e); font-weight: 400; margin-left: 8px; white-space: nowrap; }
-      .gha-log { background: var(--bgColor-default, #0d1117); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 6px 0; }
-      .gha-log-chunk { content-visibility: auto; }
-      .gha-log-line { display: grid; grid-template-columns: 10ch minmax(0, 1fr); min-height: 18px; }
-      .gha-log-line::before { border-right: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; color: var(--fgColor-muted, #8b949e); overflow: hidden; padding: 0 10px; text-align: right; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
-      .gha-log-timestamp { color: var(--fgColor-muted, #8b949e); display: none; overflow: hidden; padding: 0 10px; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
-      :host([data-gha-show-timestamps]) .gha-log-line { grid-template-columns: 10ch 25ch minmax(0, 1fr); }
-      :host([data-gha-show-timestamps]) .gha-log-timestamp { display: block; }
-      .gha-log--complete { counter-reset: gha-line; }
-      .gha-log--complete .gha-log-line { counter-increment: gha-line; }
-      .gha-log--complete .gha-log-line::before { content: counter(gha-line); }
-      .gha-log--partial .gha-log-line::before { content: attr(data-offset); }
-      .gha-log-content { min-width: 0; padding: 0 10px; tab-size: 4; white-space: pre; }
-      .gha-log-line--wrap .gha-log-content { overflow-wrap: anywhere; white-space: pre-wrap; }
-      .gha-log-status { padding: 10px; }
-    `);
 
     let body: React.ReactNode;
     if (state.status === "loading") body = React.createElement("div", { className: "gha-muted" }, "Loading GitHub Actions log data…");
@@ -900,7 +856,6 @@
         key: step.id ?? step.log_url ?? `step-${index}`,
         step,
         index,
-        onInitialLogRendered: step.logView && !isCollapsedByDefault(step) ? reportInitialLogRendered : undefined,
       }))),
     );
 
@@ -934,13 +889,12 @@
       React.Fragment,
       null,
       actionsPortal,
-      style,
       React.createElement("div", { className: "gha-root" }, React.createElement("div", { className: "gha-title" }, "GHA++"), body),
     );
   }
 
   extensionGlobal.GHAPlusPlusReactApp = {
-    mount(search, logContainer, stepsUrl): void {
+    mount(search, logContainer, stepsUrl): HTMLElement {
       const host = document.createElement("div");
       const scrollRestorationFloor = pendingScrollRestorationFloor
         ?? createScrollRestorationFloor();
@@ -953,7 +907,9 @@
       host.dataset.ghaPlusplusApp = "";
       const shadow = host.attachShadow({ mode: "open" });
       const mountPoint = document.createElement("div");
-      shadow.append(mountPoint);
+      const style = document.createElement("style");
+      style.textContent = APP_STYLES;
+      shadow.append(mountPoint, style);
       logContainer.insertAdjacentElement("afterend", host);
       stickyToolbarDisposers.set(host, keepStepHeadersBelowToolbar(host));
       ReactDOM.render(
@@ -967,6 +923,7 @@
       const observer = new ResizeObserver(() => LogViewClient.resize(host));
       observer.observe(host);
       resizeObservers.set(host, observer);
+      return host;
     },
     unmount(host): void {
       scrollRestorationFloors.get(host)?.remove();

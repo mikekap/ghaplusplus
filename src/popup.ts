@@ -2,15 +2,8 @@ export {};
 
 const ENABLED_SETTING = "viewerEnabled";
 
-interface ChromeStorage {
-  sync: {
-    get(defaults: Record<string, boolean>): Promise<Record<string, boolean>>;
-    set(items: Record<string, boolean>): Promise<void>;
-  };
-}
-
 const extensionChrome = (globalThis as typeof globalThis & {
-  chrome: { storage: ChromeStorage };
+  chrome: ExtensionChrome;
 }).chrome;
 
 function requiredElement<T extends Element>(selector: string): T {
