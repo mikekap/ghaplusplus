@@ -174,7 +174,7 @@
       private readonly step: GitHubJobStep,
       private readonly stepsUrl: string,
       private readonly signal: AbortSignal,
-    ) {}
+    ) { }
 
     private ensureHost(): Promise<Window> {
       if (this.hostReady) return this.hostReady;
@@ -787,6 +787,17 @@
       });
       return () => window.cancelAnimationFrame(frame);
     }, [host, initialLoadsComplete, pageLoadComplete, state]);
+
+    React.useEffect(() => {
+      if (state.status !== "ready") return;
+      try {
+        setTimeout(() => {
+          document.querySelector('*[data-active]')?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+        }, 1000);
+      } catch (e) {
+        console.warn(`Failed to scroll active step into view: ${e}`);
+      }
+    }, [state.status]);
 
     React.useEffect(() => {
       const controller = new AbortController();
