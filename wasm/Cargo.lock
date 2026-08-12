@@ -802,6 +802,8 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tower",

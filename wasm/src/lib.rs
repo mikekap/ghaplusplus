@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use js_sys::Array;
 #[cfg(target_arch = "wasm32")]
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE};
-use serde::Serialize;
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use serde::{Deserialize, Serialize};
 #[cfg(target_arch = "wasm32")]
 use std::cell::{Cell, RefCell};
 use std::fmt::Write;
@@ -24,7 +24,9 @@ pub struct LogParser {
 #[wasm_bindgen]
 pub struct LogSource {
     #[cfg(target_arch = "wasm32")]
-    log_url: String,
+    source_url: String,
+    #[cfg(target_arch = "wasm32")]
+    backscroll: bool,
     #[cfg(target_arch = "wasm32")]
     fetched: Rc<RefCell<Option<LogData>>>,
 }
@@ -75,7 +77,6 @@ pub enum LogElement {
 #[derive(Serialize)]
 struct RenderedLog {
     chunks: Vec<RenderedChunk>,
-    length: u64,
     complete: bool,
     #[serde(rename = "wrapColumns")]
     wrap_columns: u32,
@@ -93,7 +94,7 @@ struct RenderedChunk {
 struct LogData {
     elements: Vec<LogElement>,
     start: u64,
-    length: u64,
+    line_number_start: Option<u64>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -104,7 +105,49 @@ struct ContentRange {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[derive(Deserialize)]
+struct BackscrollResponse {
+    lines: Vec<BackscrollLine>,
+}
+
+#[derive(Deserialize)]
+struct BackscrollLine {
+    id: String,
+    line: String,
+}
+
+#[cfg(target_arch = "wasm32")]
 const LOG_RANGE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn backscroll_elements(lines: &[BackscrollLine]) -> Vec<LogElement> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let timestamp = line
+                .id
+                .split_once('-')
+                .and_then(|(timestamp, _)| timestamp.parse::<i64>().ok())
+                .and_then(DateTime::<Utc>::from_timestamp_millis);
+            let text = timestamp
+                .map(|timestamp| {
+                    format!(
+                        "{} {}",
+                        timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        line.line,
+                    )
+                })
+                .unwrap_or_else(|| line.line.clone());
+            LogParser::parse_line(&text, index as u64)
+        })
+        .collect()
+}
+
+fn backscroll_line_number(line: &BackscrollLine) -> Option<u64> {
+    line.id
+        .split_once('-')
+        .and_then(|(_, line_number)| line_number.parse().ok())
+}
 
 #[wasm_bindgen]
 impl LogParser {
@@ -141,9 +184,10 @@ impl LogParser {
 #[wasm_bindgen]
 impl LogSource {
     #[wasm_bindgen(constructor)]
-    pub fn new(log_url: String) -> Self {
+    pub fn new(source_url: String, backscroll: bool) -> Self {
         Self {
-            log_url,
+            source_url,
+            backscroll,
             fetched: Rc::new(RefCell::new(None)),
         }
     }
@@ -157,10 +201,14 @@ impl LogSource {
     }
 
     pub async fn fetch(&self) -> Result<(), JsValue> {
+        if self.backscroll {
+            return self.fetch_backscroll().await;
+        }
+
         // Azure's Actions log endpoint does not reliably honor suffix ranges.
         // Probe from byte zero for the total length, then fetch an explicit tail.
         let (front_range, front_bytes) =
-            fetch_log_range(&self.log_url, format!("bytes=0-{}", LOG_RANGE_BYTES - 1)).await?;
+            fetch_log_range(&self.source_url, format!("bytes=0-{}", LOG_RANGE_BYTES - 1)).await?;
         let length = if front_range.length == 0 {
             front_bytes.len() as u64
         } else {
@@ -176,7 +224,7 @@ impl LogSource {
                 ));
             }
             fetch_log_range(
-                &self.log_url,
+                &self.source_url,
                 format!(
                     "bytes={}-{}",
                     length.saturating_sub(LOG_RANGE_BYTES),
@@ -197,12 +245,15 @@ impl LogSource {
         *self.fetched.borrow_mut() = Some(LogData {
             elements,
             start: range.start,
-            length,
+            line_number_start: None,
         });
         Ok(())
     }
 
     pub async fn fetch_previous(&self) -> Result<(), JsValue> {
+        if self.backscroll {
+            return Ok(());
+        }
         let current_start = self
             .fetched
             .borrow()
@@ -216,7 +267,7 @@ impl LogSource {
         let range_end = current_start - 1;
         let range_start = range_end.saturating_sub(LOG_RANGE_BYTES - 1);
         let (range, bytes) =
-            fetch_log_range(&self.log_url, format!("bytes={range_start}-{range_end}")).await?;
+            fetch_log_range(&self.source_url, format!("bytes={range_start}-{range_end}")).await?;
         let mut parser = LogParser::with_offset(range.start > 0, range.start);
         // The final bytes continue the partial line discarded from the current
         // range, so do not flush this parser's trailing line.
@@ -227,9 +278,33 @@ impl LogSource {
         let fetched = fetched_ref.as_mut().expect("checked above");
         fetched.elements.splice(0..0, elements);
         fetched.start = range.start;
-        if range.length != 0 {
-            fetched.length = range.length;
+        Ok(())
+    }
+
+    async fn fetch_backscroll(&self) -> Result<(), JsValue> {
+        let response = reqwest::Client::new()
+            .get(&self.source_url)
+            .header(ACCEPT, "application/json")
+            .fetch_credentials_include()
+            .send()
+            .await
+            .map_err(request_error)?;
+        if !response.status().is_success() {
+            return Err(JsValue::from_str(&format!(
+                "Backscroll request failed with HTTP {}",
+                response.status()
+            )));
         }
+
+        let response = response
+            .json::<BackscrollResponse>()
+            .await
+            .map_err(request_error)?;
+        *self.fetched.borrow_mut() = Some(LogData {
+            elements: backscroll_elements(&response.lines),
+            start: 0,
+            line_number_start: response.lines.first().and_then(backscroll_line_number),
+        });
         Ok(())
     }
 }
@@ -275,10 +350,18 @@ impl LogView {
             .ok_or_else(|| JsValue::from_str("Log source has not fetched a range"))?;
         let start = self.start.get().unwrap_or(fetched.start);
         let wrap_columns = self.wrap_columns.get();
+        let complete = fetched
+            .line_number_start
+            .map_or(start == 0, |line_number| line_number == 1);
+        let line_number_start = fetched.line_number_start.or_else(|| complete.then_some(1));
         serde_wasm_bindgen::to_value(&RenderedLog {
-            chunks: render_chunks_from(&fetched.elements, start, wrap_columns as usize),
-            length: fetched.length,
-            complete: start == 0,
+            chunks: render_chunks_from(
+                &fetched.elements,
+                start,
+                wrap_columns as usize,
+                line_number_start,
+            ),
+            complete,
             wrap_columns,
         })
         .map_err(|error| JsValue::from_str(&format!("Failed to serialize rendered log: {error}")))
@@ -464,19 +547,21 @@ const LOG_CHUNK_ROWS: usize = 200;
 
 #[cfg(test)]
 fn render_chunks(elements: &[LogElement], wrap_columns: usize) -> Vec<RenderedChunk> {
-    render_chunks_from(elements, 0, wrap_columns)
+    render_chunks_from(elements, 0, wrap_columns, Some(1))
 }
 
 fn render_chunks_from(
     elements: &[LogElement],
     start_offset: u64,
     wrap_columns: usize,
+    line_number_start: Option<u64>,
 ) -> Vec<RenderedChunk> {
     let mut chunks = Vec::new();
     let mut html = String::new();
     let mut rows = 0;
     let mut estimated_height = 0;
     let wrap_columns = wrap_columns.max(40);
+    let mut line_number = line_number_start;
 
     let mut append = |timestamp: &JSDateTime, line_html: &str, byte_offset: u64| {
         let visible_columns = html_visible_columns(line_html);
@@ -489,10 +574,16 @@ fn render_chunks_from(
         } else {
             String::new()
         };
+        let gutter = line_number
+            .map(|line_number| line_number.to_string())
+            .unwrap_or_else(|| format!("B{byte_offset}"));
+        if let Some(line_number) = line_number.as_mut() {
+            *line_number += 1;
+        }
         let wrap_class = if wraps { " gha-log-line--wrap" } else { "" };
         let _ = write!(
             html,
-            "<div class=\"gha-log-line{wrap_class}\" data-offset=\"B{byte_offset}\"><span class=\"gha-log-timestamp\">{timestamp}</span><span class=\"gha-log-content\">{line_html}</span></div>"
+            "<div class=\"gha-log-line{wrap_class}\" data-offset=\"{gutter}\"><span class=\"gha-log-timestamp\">{timestamp}</span><span class=\"gha-log-content\">{line_html}</span></div>"
         );
         rows += 1;
         estimated_height += estimated_visual_rows * 18;
@@ -644,6 +735,35 @@ mod tests {
     }
 
     #[test]
+    fn preserves_backscroll_timestamp_and_starting_line_number() {
+        let response = [
+            BackscrollLine {
+                id: "1786507993989-417".into(),
+                line: "\x1b[36;1mdocker run \\\x1b[0m".into(),
+            },
+            BackscrollLine {
+                id: "invalid".into(),
+                line: "plain output".into(),
+            },
+        ];
+        let lines = backscroll_elements(&response);
+
+        let [LogElement::Line(timestamp, text, 0), LogElement::Line(fallback, plain, 1)] =
+            lines.as_slice()
+        else {
+            panic!("unexpected backscroll parse result");
+        };
+        assert_eq!(timestamp.dt.timestamp_millis(), 1_786_507_993_989);
+        assert!(text.contains("docker run"));
+        assert_eq!(fallback.dt.timestamp_millis(), 0);
+        assert_eq!(plain, "plain output");
+        assert_eq!(backscroll_line_number(&response[0]), Some(417));
+        let chunks = render_chunks_from(&lines, 0, 80, Some(417));
+        assert!(chunks[0].html.contains("data-offset=\"417\""));
+        assert!(chunks[0].html.contains("data-offset=\"418\""));
+    }
+
+    #[test]
     fn counts_visible_html_columns() {
         assert_eq!(
             html_visible_columns("<span style='color:var(--red,#a00)'>&lt;abc&gt;</span>"),
@@ -662,8 +782,21 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].rows, 1);
         assert_eq!(chunks[0].estimated_height, 36);
-        assert!(chunks[0].html.contains("data-offset=\"B99\""));
+        assert!(chunks[0].html.contains("data-offset=\"1\""));
         assert!(chunks[0].html.contains("gha-log-line--wrap"));
+    }
+
+    #[test]
+    fn numbers_lines_across_render_chunks() {
+        let timestamp = JSDateTime::from(DateTime::from_timestamp_millis(1).unwrap());
+        let lines = (0..201)
+            .map(|offset| LogElement::Line(timestamp.clone(), "line".into(), offset))
+            .collect::<Vec<_>>();
+
+        let chunks = render_chunks_from(&lines, 0, 80, Some(417));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].html.contains("data-offset=\"616\""));
+        assert!(chunks[1].html.contains("data-offset=\"617\""));
     }
 
     #[test]
@@ -674,9 +807,10 @@ mod tests {
             LogElement::Line(timestamp, "current".into(), 20),
         ];
 
-        let chunks = render_chunks_from(&lines, 20, 80);
+        let chunks = render_chunks_from(&lines, 20, 80, None);
         assert_eq!(chunks.len(), 1);
         assert!(!chunks[0].html.contains("old"));
         assert!(chunks[0].html.contains("current"));
+        assert!(chunks[0].html.contains("data-offset=\"B20\""));
     }
 }

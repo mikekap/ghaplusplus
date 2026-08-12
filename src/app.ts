@@ -1,15 +1,7 @@
 (() => {
   "use strict";
 
-  interface JobStep {
-    id?: string;
-    log_url: string | null;
-    name?: string;
-    number?: number;
-    status?: string | null;
-    conclusion?: string | null;
-    started_at?: string | null;
-    completed_at?: string | null;
+  interface JobStep extends GitHubJobStep {
     logView?: LogViewClient;
   }
 
@@ -53,14 +45,10 @@
     .gha-log { background: var(--bgColor-default, #0d1117); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 6px 0; }
     .gha-log-chunk { content-visibility: auto; }
     .gha-log-line { display: grid; grid-template-columns: 10ch minmax(0, 1fr); min-height: 18px; }
-    .gha-log-line::before { border-right: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; color: var(--fgColor-muted, #8b949e); overflow: hidden; padding: 0 10px; text-align: right; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
+    .gha-log-line::before { border-right: 1px solid var(--borderColor-muted, #21262d); box-sizing: border-box; color: var(--fgColor-muted, #8b949e); content: attr(data-offset); overflow: hidden; padding: 0 10px; text-align: right; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
     .gha-log-timestamp { color: var(--fgColor-muted, #8b949e); display: none; overflow: hidden; padding: 0 10px; text-overflow: ellipsis; user-select: none; white-space: nowrap; }
     :host([data-gha-show-timestamps]) .gha-log-line { grid-template-columns: 10ch 25ch minmax(0, 1fr); }
     :host([data-gha-show-timestamps]) .gha-log-timestamp { display: block; }
-    .gha-log--complete { counter-reset: gha-line; }
-    .gha-log--complete .gha-log-line { counter-increment: gha-line; }
-    .gha-log--complete .gha-log-line::before { content: counter(gha-line); }
-    .gha-log--partial .gha-log-line::before { content: attr(data-offset); }
     .gha-log-content { min-width: 0; padding: 0 10px; tab-size: 4; white-space: pre; }
     .gha-log-line--wrap .gha-log-content { overflow-wrap: anywhere; white-space: pre-wrap; }
     .gha-log-status { padding: 10px; }
@@ -183,7 +171,8 @@
     private hostReady: Promise<Window> | null = null;
 
     constructor(
-      private readonly logUrl: string,
+      private readonly step: GitHubJobStep,
+      private readonly stepsUrl: string,
       private readonly signal: AbortSignal,
     ) {}
 
@@ -201,8 +190,17 @@
         const handleLoad = (): void => {
           cleanupLoad();
           const hostWindow = host.contentWindow;
-          if (hostWindow) resolve(hostWindow);
-          else {
+          if (hostWindow) {
+            hostWindow.postMessage(
+              {
+                type: "initialize-source",
+                step: this.step,
+                stepsUrl: this.stepsUrl,
+              } satisfies InitializeLogSourceMessage,
+              WORKER_HOST_ORIGIN,
+            );
+            resolve(hostWindow);
+          } else {
             signal.removeEventListener("abort", handleAbort);
             host.remove();
             reject(new Error("Log source host has no content window"));
@@ -238,7 +236,6 @@
         hostWindow.postMessage(
           {
             type: "create-view",
-            logUrl: this.logUrl,
             wrapColumns,
           } satisfies CreateLogViewMessage,
           WORKER_HOST_ORIGIN,
@@ -448,7 +445,7 @@
       return { icon: "◌", label: "Queued", message: "Queued — GitHub has not created a log for this step yet.", kind: "queued" };
     }
     if (step.status === "in_progress") {
-      return { icon: "◐", label: "In progress", message: "In progress — live log retrieval is not implemented yet.", kind: "in-progress" };
+      return { icon: "◐", label: "In progress", message: "In progress — waiting for log output.", kind: "in-progress" };
     }
     switch (step.conclusion) {
       case "success":
@@ -602,7 +599,7 @@
         fragment.append(element);
       });
       this.element.insertBefore(fragment, this.element.children.item(splice.index));
-      this.element.className = `gha-log ${render.complete ? "gha-log--complete" : "gha-log--partial"}`;
+      this.element.className = "gha-log";
     }
 
     private reportError(error: unknown): void {
@@ -657,7 +654,7 @@
     const duration = stepDuration(step);
     const presentation = stepPresentation(step);
     const skipped = presentation.kind === "skipped";
-    const logless = step.log_url ? null : presentation;
+    const logless = step.logView ? null : presentation;
     const scrollToStep = (position: "start" | "end"): void => {
       const target = section.current;
       if (!target) return;
@@ -769,6 +766,10 @@
 
     React.useEffect(() => {
       if (pageLoadComplete) return undefined;
+      if (document.readyState === "complete") {
+        setTimeout(() => setPageLoadComplete(true), 0);
+        return () => undefined;
+      }
       const handleLoad = (): void => setPageLoadComplete(true);
       window.addEventListener("load", handleLoad, { once: true });
       return () => window.removeEventListener("load", handleLoad);
@@ -816,9 +817,13 @@
           }
         }
         const steps = rawSteps.map((step) => {
-          if (!step.log_url || stepPresentation(step).kind === "skipped") return step;
+          const running = step.status === "in_progress";
+          if ((!step.log_url && !(running && step.id)) || stepPresentation(step).kind === "skipped") {
+            return step;
+          }
           const source = new LogSourceClient(
-            new URL(step.log_url, location.origin).href,
+            step,
+            new URL(stepsUrl, location.origin).href,
             signal,
           );
           return {

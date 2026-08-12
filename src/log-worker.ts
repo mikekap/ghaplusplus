@@ -4,7 +4,6 @@ const wasmReady = init({
   module_or_path: new URL("./wasm/ghaplusplus_wasm_bg.wasm", import.meta.url),
 });
 
-let sourceUrl: string | null = null;
 let sourceReady: Promise<LogSource> | null = null;
 let initialFetch: Promise<void> | null = null;
 let previousFetch: Promise<void> | null = null;
@@ -39,13 +38,27 @@ function changedChunks(previous: RenderedChunk[], next: RenderedChunk[]): Render
   };
 }
 
-function getSource(logUrl: string): Promise<LogSource> {
-  if (sourceUrl && sourceUrl !== logUrl) {
-    return Promise.reject(new Error("Log worker cannot serve multiple log sources"));
+function resolveSource(step: GitHubJobStep, stepsUrl: string): { url: string; backscroll: boolean } {
+  if (step.status === "in_progress") {
+    if (!step.id) throw new Error("Running log step has no ID");
+    const url = new URL(stepsUrl);
+    if (!/\/actions\/runs\/\d+\/jobs\/\d+\/steps\/?$/.test(url.pathname)) {
+      throw new Error("Unable to determine the running log endpoint from the steps URL");
+    }
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/${encodeURIComponent(step.id)}/backscroll`;
+    url.search = "";
+    url.hash = "";
+    return { url: url.href, backscroll: true };
   }
-  sourceUrl = logUrl;
-  sourceReady ??= wasmReady.then(() => new LogSource(logUrl));
-  return sourceReady;
+  if (!step.log_url) throw new Error("Completed log step has no log URL");
+  return { url: new URL(step.log_url, new URL("/", stepsUrl)).href, backscroll: false };
+}
+
+function initializeSource(step: GitHubJobStep, stepsUrl: string): void {
+  sourceReady ??= wasmReady.then(() => {
+    const source = resolveSource(step, stepsUrl);
+    return new LogSource(source.url, source.backscroll);
+  });
 }
 
 function loadSource(source: LogSource): Promise<void> {
@@ -119,11 +132,16 @@ function createView(source: LogSource, port: MessagePort, wrapColumns: number): 
   port.start();
 }
 
-self.addEventListener("message", (event: MessageEvent<CreateLogViewMessage>) => {
+self.addEventListener("message", (event: MessageEvent<LogWorkerMessage>) => {
   const message = event.data;
+  if (message.type === "initialize-source") {
+    initializeSource(message.step, message.stepsUrl);
+    return;
+  }
   const port = event.ports[0];
   if (!port) return;
-  void getSource(message.logUrl).then(
+  const source = sourceReady ?? Promise.reject(new Error("Log worker source was not initialized"));
+  void source.then(
     (source) => createView(source, port, message.wrapColumns),
     (error: unknown) => {
       port.postMessage({ type: "error", message: errorMessage(error) } satisfies LogViewEvent);

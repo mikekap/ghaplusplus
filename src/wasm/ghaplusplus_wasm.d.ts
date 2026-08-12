@@ -3,7 +3,7 @@ export default function init(options: {
 }): Promise<unknown>;
 
 export class LogSource {
-  constructor(url: string);
+  constructor(url: string, backscroll: boolean);
   create_view(wrapColumns: number): LogView;
   fetch(): Promise<void>;
   fetch_previous(): Promise<void>;

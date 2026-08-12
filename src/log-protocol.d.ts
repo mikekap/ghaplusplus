@@ -1,3 +1,14 @@
+interface GitHubJobStep {
+  id?: string;
+  log_url: string | null;
+  name?: string;
+  number?: number;
+  status?: string | null;
+  conclusion?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
 interface RenderedChunk {
   html: string;
   rows: number;
@@ -16,11 +27,18 @@ interface RenderSplice {
   chunks: RenderedChunk[];
 }
 
+interface InitializeLogSourceMessage {
+  type: "initialize-source";
+  step: GitHubJobStep;
+  stepsUrl: string;
+}
+
 interface CreateLogViewMessage {
   type: "create-view";
-  logUrl: string;
   wrapColumns: number;
 }
+
+type LogWorkerMessage = InitializeLogSourceMessage | CreateLogViewMessage;
 
 type LogViewCommand =
   | { type: "load" }
