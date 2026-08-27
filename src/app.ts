@@ -90,8 +90,8 @@
 
     load(): Promise<void> {
       if (this.pendingLoad) return this.pendingLoad;
-      this.post({ type: "load" });
       this.pendingLoad = new Promise((resolve) => { this.resolveLoad = resolve; });
+      this.post({ type: "load" });
       return this.pendingLoad;
     }
 
