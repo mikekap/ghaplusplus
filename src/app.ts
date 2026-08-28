@@ -17,6 +17,7 @@
   const scrollRestorationFloors = new WeakMap<HTMLElement, HTMLStyleElement>();
   const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
   const SCROLL_RESTORATION_MIN_HEIGHT = "10000000px";
+  const QUEUED_STEP_STATUSES = ["queued", "requested", "pending", "waiting"];
   const WORKER_HOST_URL = extensionChrome.runtime.getURL("worker-host.html");
   const WORKER_HOST_ORIGIN = new URL(WORKER_HOST_URL).origin;
   const APP_STYLES = `
@@ -41,6 +42,9 @@
     .gha-step-icon, .gha-step-chevron { color: var(--fgColor-muted, #8b949e); display: inline-block; margin-right: 6px; }
     .gha-step-chevron { width: 1em; }
     .gha-step-icon { width: 1.25em; text-align: center; }
+    .gha-step--in-progress .gha-step-icon { animation: gha-step-spin 900ms linear infinite; }
+    @keyframes gha-step-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .gha-step--in-progress .gha-step-icon { animation: none; } }
     .gha-step-duration { color: var(--fgColor-muted, #8b949e); font-weight: 400; margin-left: 8px; white-space: nowrap; }
     .gha-log { background: var(--bgColor-default, #0d1117); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 6px 0; }
     .gha-log-chunk { content-visibility: auto; }
@@ -53,6 +57,23 @@
     .gha-log-line--wrap .gha-log-content { overflow-wrap: anywhere; white-space: pre-wrap; }
     .gha-log-status { padding: 10px; }
   `;
+
+  function createLiveLogPort(step: GitHubJobStep): MessagePort | null {
+    if (!isLiveStep(step) || !step.id) return null;
+    const channel = new MessageChannel();
+    window.postMessage({
+      type: "gha-plusplus-connect-live-broker",
+    } satisfies ConnectLiveBrokerMessage, location.origin, [channel.port1]);
+    return channel.port2;
+  }
+
+  function isQueuedStep(step: GitHubJobStep): boolean {
+    return QUEUED_STEP_STATUSES.includes(step.status ?? "");
+  }
+
+  function isLiveStep(step: GitHubJobStep): boolean {
+    return step.status === "in_progress" || isQueuedStep(step);
+  }
 
   function createScrollRestorationFloor(): HTMLStyleElement {
     const floor = document.createElement("style");
@@ -166,23 +187,25 @@
     }
   }
 
-  /** A lazily started extension worker that owns one shared fetched log source. */
+  /** An extension worker that owns one shared fetched log source. */
   class LogSourceClient {
-    private hostReady: Promise<Window> | null = null;
+    private readonly hostReady: Promise<Window>;
 
     constructor(
       private readonly step: GitHubJobStep,
       private readonly stepsUrl: string,
       private readonly signal: AbortSignal,
-    ) { }
+    ) {
+      this.hostReady = this.createHost();
+      void this.hostReady.catch(() => {});
+    }
 
-    private ensureHost(): Promise<Window> {
-      if (this.hostReady) return this.hostReady;
+    private createHost(): Promise<Window> {
       const { signal } = this;
       const host = document.createElement("iframe");
       host.hidden = true;
       host.src = WORKER_HOST_URL;
-      this.hostReady = new Promise<Window>((resolve, reject) => {
+      const ready = new Promise<Window>((resolve, reject) => {
         const cleanupLoad = (): void => {
           host.removeEventListener("load", handleLoad);
           host.removeEventListener("error", handleError);
@@ -191,6 +214,7 @@
           cleanupLoad();
           const hostWindow = host.contentWindow;
           if (hostWindow) {
+            const livePort = createLiveLogPort(this.step);
             hostWindow.postMessage(
               {
                 type: "initialize-source",
@@ -198,6 +222,7 @@
                 stepsUrl: this.stepsUrl,
               } satisfies InitializeLogSourceMessage,
               WORKER_HOST_ORIGIN,
+              livePort ? [livePort] : [],
             );
             resolve(hostWindow);
           } else {
@@ -222,7 +247,7 @@
         signal.addEventListener("abort", handleAbort, { once: true });
       });
       document.documentElement.append(host);
-      return this.hostReady;
+      return ready;
     }
 
     async createView(
@@ -232,7 +257,7 @@
       const channel = new MessageChannel();
       const view = new WorkerLogViewClient(channel.port2, listener);
       try {
-        const hostWindow = await this.ensureHost();
+        const hostWindow = await this.hostReady;
         hostWindow.postMessage(
           {
             type: "create-view",
@@ -441,7 +466,7 @@
   }
 
   function stepPresentation(step: JobStep): StepPresentation {
-    if (["queued", "requested", "pending", "waiting"].includes(step.status ?? "")) {
+    if (isQueuedStep(step)) {
       return { icon: "◌", label: "Queued", message: "Queued — GitHub has not created a log for this step yet.", kind: "queued" };
     }
     if (step.status === "in_progress") {
@@ -693,7 +718,7 @@
 
     return React.createElement(
       "section",
-      { ref: section, className: `gha-step${logless ? ` gha-step--no-log gha-step--${presentation.kind}` : ""}` },
+      { ref: section, className: `gha-step gha-step--${presentation.kind}${logless ? " gha-step--no-log" : ""}` },
       React.createElement(
         "div",
         { className: "gha-step-title" },
@@ -828,8 +853,8 @@
           }
         }
         const steps = rawSteps.map((step) => {
-          const running = step.status === "in_progress";
-          if ((!step.log_url && !(running && step.id)) || stepPresentation(step).kind === "skipped") {
+          const live = isLiveStep(step);
+          if ((!step.log_url && !(live && step.id)) || stepPresentation(step).kind === "skipped") {
             return step;
           }
           const source = new LogSourceClient(

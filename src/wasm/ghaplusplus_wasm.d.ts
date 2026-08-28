@@ -7,6 +7,7 @@ export class LogSource {
   create_view(wrapColumns: number): LogView;
   fetch(): Promise<void>;
   fetch_previous(): Promise<void>;
+  append_live(event: GitHubLiveLogEvent): boolean;
   free(): void;
 }
 
@@ -14,6 +15,7 @@ export class LogView {
   private constructor();
   initialize_window(): unknown;
   expand_to_source_start(): unknown;
+  render_current(): unknown;
   set_wrap_columns(wrapColumns: number): unknown;
   free(): void;
 }

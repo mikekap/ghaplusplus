@@ -7,6 +7,11 @@ const wasmReady = init({
 let sourceReady: Promise<LogSource> | null = null;
 let initialFetch: Promise<void> | null = null;
 let previousFetch: Promise<void> | null = null;
+let waitingForLiveOutput = false;
+const activeViews = new Set<{
+  renderLive: () => void;
+  reportError: (error: unknown) => void;
+}>();
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -39,8 +44,8 @@ function changedChunks(previous: RenderedChunk[], next: RenderedChunk[]): Render
 }
 
 function resolveSource(step: GitHubJobStep, stepsUrl: string): { url: string; backscroll: boolean } {
-  if (step.status === "in_progress") {
-    if (!step.id) throw new Error("Running log step has no ID");
+  if (["queued", "requested", "pending", "waiting", "in_progress"].includes(step.status ?? "")) {
+    if (!step.id) throw new Error("Live log step has no ID");
     const url = new URL(stepsUrl);
     if (!/\/actions\/runs\/\d+\/jobs\/\d+\/steps\/?$/.test(url.pathname)) {
       throw new Error("Unable to determine the running log endpoint from the steps URL");
@@ -54,15 +59,39 @@ function resolveSource(step: GitHubJobStep, stepsUrl: string): { url: string; ba
   return { url: new URL(step.log_url, new URL("/", stepsUrl)).href, backscroll: false };
 }
 
-function initializeSource(step: GitHubJobStep, stepsUrl: string): void {
+function initializeSource(
+  step: GitHubJobStep,
+  stepsUrl: string,
+  livePort?: MessagePort,
+): void {
+  waitingForLiveOutput = ["queued", "requested", "pending", "waiting"].includes(step.status ?? "");
   sourceReady ??= wasmReady.then(() => {
     const source = resolveSource(step, stepsUrl);
     return new LogSource(source.url, source.backscroll);
   });
+  const ready = sourceReady;
+  if (livePort) {
+    livePort.onmessage = (event: MessageEvent<LiveBrokerEvent>): void => {
+      const message = event.data;
+      if (message.type !== "step-log") return;
+      void ready.then(async (source) => {
+        await loadSource(source);
+        if (source.append_live(message.event)) {
+          activeViews.forEach((view) => view.renderLive());
+        }
+      })
+        .catch((error: unknown) => activeViews.forEach((view) => view.reportError(error)));
+    };
+    livePort.postMessage({
+      type: "subscribe-step-log",
+      stepId: step.id!,
+    } satisfies LiveBrokerCommand);
+    livePort.start();
+  }
 }
 
 function loadSource(source: LogSource): Promise<void> {
-  initialFetch ??= source.fetch();
+  initialFetch ??= waitingForLiveOutput ? Promise.resolve() : source.fetch();
   return initialFetch;
 }
 
@@ -77,6 +106,7 @@ function fetchPreviousSource(source: LogSource): Promise<void> {
 function createView(source: LogSource, port: MessagePort, wrapColumns: number): void {
   const view: LogView = source.create_view(wrapColumns);
   let closed = false;
+  let loaded = false;
   let renderTimer: number | undefined;
   let pendingRender: RenderedLog | null = null;
   let renderedChunks: RenderedChunk[] = [];
@@ -111,13 +141,25 @@ function createView(source: LogSource, port: MessagePort, wrapColumns: number): 
     if (renderTimer !== undefined) clearTimeout(renderTimer);
     port.onmessage = null;
     port.removeEventListener("close", close);
+    activeViews.delete(activeView);
     view.free();
   };
+
+  const activeView = {
+    renderLive: (): void => {
+      if (loaded) render(view.render_current());
+    },
+    reportError: postError,
+  };
+  activeViews.add(activeView);
 
   port.onmessage = (event: MessageEvent<LogViewCommand>): void => {
     const command = event.data;
     if (command.type === "load") {
-      void loadSource(source).then(() => view.initialize_window()).then(render, postError);
+      void loadSource(source).then(() => {
+        loaded = true;
+        return view.initialize_window();
+      }).then(render, postError);
     } else if (command.type === "fetch-previous") {
       void fetchPreviousSource(source).then(() => view.expand_to_source_start()).then(render, postError);
     } else if (command.type === "set-wrap-columns") {
@@ -135,7 +177,7 @@ function createView(source: LogSource, port: MessagePort, wrapColumns: number): 
 self.addEventListener("message", (event: MessageEvent<LogWorkerMessage>) => {
   const message = event.data;
   if (message.type === "initialize-source") {
-    initializeSource(message.step, message.stepsUrl);
+    initializeSource(message.step, message.stepsUrl, event.ports[0]);
     return;
   }
   const port = event.ports[0];

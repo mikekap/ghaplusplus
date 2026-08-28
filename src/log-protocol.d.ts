@@ -9,6 +9,46 @@ interface GitHubJobStep {
   completed_at?: string | null;
 }
 
+interface GitHubLiveLogLine {
+  lineID: string;
+  line: string;
+}
+
+interface GitHubLiveLogEvent {
+  stepId: string;
+  startLine: number;
+  lines: GitHubLiveLogLine[];
+}
+
+interface ConnectLiveBrokerMessage {
+  type: "gha-plusplus-connect-live-broker";
+}
+
+interface LiveBrokerCommand {
+  type: "subscribe-step-log";
+  stepId: string;
+}
+
+interface LiveBrokerEvent {
+  type: "step-log";
+  event: GitHubLiveLogEvent;
+}
+
+interface GitHubSocketTopic {
+  name: string;
+  signed: string;
+  offset: number;
+}
+
+interface GitHubSocketEvent {
+  channel: string;
+  type: "message" | "presence";
+  data: {
+    kind?: number;
+    data?: unknown;
+  };
+}
+
 interface RenderedChunk {
   html: string;
   rows: number;

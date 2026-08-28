@@ -95,6 +95,7 @@ struct LogData {
     elements: Vec<LogElement>,
     start: u64,
     line_number_start: Option<u64>,
+    line_ids: std::collections::HashSet<String>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -108,6 +109,20 @@ struct ContentRange {
 #[derive(Deserialize)]
 struct BackscrollResponse {
     lines: Vec<BackscrollLine>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Deserialize)]
+struct LiveLogEvent {
+    lines: Vec<LiveLogLine>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Deserialize)]
+struct LiveLogLine {
+    #[serde(rename = "lineID")]
+    line_id: String,
+    line: String,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +164,26 @@ fn backscroll_line_number(line: &BackscrollLine) -> Option<u64> {
         .and_then(|(_, line_number)| line_number.parse().ok())
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+fn deduplicate_live_lines(
+    line_ids: &mut std::collections::HashSet<String>,
+    lines: Vec<LiveLogLine>,
+) -> Vec<BackscrollLine> {
+    let mut lines = lines
+        .into_iter()
+        .filter_map(|line| {
+            line_ids
+                .insert(line.line_id.clone())
+                .then_some(BackscrollLine {
+                    id: line.line_id,
+                    line: line.line,
+                })
+        })
+        .collect::<Vec<_>>();
+    lines.sort_by_key(backscroll_line_number);
+    lines
+}
+
 #[wasm_bindgen]
 impl LogParser {
     #[wasm_bindgen(constructor)]
@@ -185,10 +220,16 @@ impl LogParser {
 impl LogSource {
     #[wasm_bindgen(constructor)]
     pub fn new(source_url: String, backscroll: bool) -> Self {
+        let fetched = backscroll.then(|| LogData {
+            elements: Vec::new(),
+            start: 0,
+            line_number_start: None,
+            line_ids: std::collections::HashSet::new(),
+        });
         Self {
             source_url,
             backscroll,
-            fetched: Rc::new(RefCell::new(None)),
+            fetched: Rc::new(RefCell::new(fetched)),
         }
     }
 
@@ -246,6 +287,7 @@ impl LogSource {
             elements,
             start: range.start,
             line_number_start: None,
+            line_ids: std::collections::HashSet::new(),
         });
         Ok(())
     }
@@ -300,12 +342,32 @@ impl LogSource {
             .json::<BackscrollResponse>()
             .await
             .map_err(request_error)?;
+        let line_ids = response.lines.iter().map(|line| line.id.clone()).collect();
         *self.fetched.borrow_mut() = Some(LogData {
             elements: backscroll_elements(&response.lines),
             start: 0,
             line_number_start: response.lines.first().and_then(backscroll_line_number),
+            line_ids,
         });
         Ok(())
+    }
+
+    pub fn append_live(&self, event: JsValue) -> Result<bool, JsValue> {
+        let event = serde_wasm_bindgen::from_value::<LiveLogEvent>(event)
+            .map_err(|error| JsValue::from_str(&format!("Invalid live log event: {error}")))?;
+        let mut fetched_ref = self.fetched.borrow_mut();
+        let fetched = fetched_ref
+            .as_mut()
+            .expect("live events are appended after the initial fetch");
+        let lines = deduplicate_live_lines(&mut fetched.line_ids, event.lines);
+        if lines.is_empty() {
+            return Ok(false);
+        }
+        if fetched.line_number_start.is_none() {
+            fetched.line_number_start = lines.first().and_then(backscroll_line_number);
+        }
+        fetched.elements.extend(backscroll_elements(&lines));
+        Ok(true)
     }
 }
 
@@ -337,6 +399,10 @@ impl LogView {
 
     pub fn set_wrap_columns(&self, wrap_columns: u32) -> Result<JsValue, JsValue> {
         self.wrap_columns.set(wrap_columns.max(40));
+        self.render()
+    }
+
+    pub fn render_current(&self) -> Result<JsValue, JsValue> {
         self.render()
     }
 }
@@ -761,6 +827,35 @@ mod tests {
         let chunks = render_chunks_from(&lines, 0, 80, Some(417));
         assert!(chunks[0].html.contains("data-offset=\"417\""));
         assert!(chunks[0].html.contains("data-offset=\"418\""));
+    }
+
+    #[test]
+    fn deduplicates_and_orders_live_lines() {
+        let mut line_ids = std::collections::HashSet::from(["1786507993989-41".into()]);
+        let lines = deduplicate_live_lines(
+            &mut line_ids,
+            vec![
+                LiveLogLine {
+                    line_id: "1786507993989-43".into(),
+                    line: "third".into(),
+                },
+                LiveLogLine {
+                    line_id: "1786507993989-41".into(),
+                    line: "duplicate".into(),
+                },
+                LiveLogLine {
+                    line_id: "1786507993989-42".into(),
+                    line: "second".into(),
+                },
+            ],
+        );
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(backscroll_line_number(&lines[0]), Some(42));
+        assert_eq!(backscroll_line_number(&lines[1]), Some(43));
+        assert!(line_ids.contains("1786507993989-41"));
+        assert!(line_ids.contains("1786507993989-42"));
+        assert!(line_ids.contains("1786507993989-43"));
     }
 
     #[test]
