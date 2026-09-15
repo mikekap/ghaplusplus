@@ -18,9 +18,6 @@ responsive and make live output easier to follow.
   actions. Click **Following** to turn it off.
 - A link to GitHub's raw logs and a popup toggle to enable or disable the viewer.
 
-Live streaming is experimental. It uses GitHub's internal SharedWorker protocol
-and page markup, which can change without notice.
-
 ## Build and install
 
 You need Chrome, Node.js with npm, and a Rust toolchain installed through rustup.
