@@ -71,16 +71,6 @@ Each successful run uploads a `ghaplusplus-<commit>` artifact. Download its ZIP
 for the Chrome Web Store, or extract it and use **Load unpacked** in Chrome.
 The archive contains the manifest, icons, HTML, and compiled JavaScript/WASM.
 
-Pushes and manual runs on `master` also upload a signed `ghaplusplus.crx`.
-Chrome packs the same staged files using the `CRX_PRIVATE_KEY` repository secret,
-which keeps the CRX extension ID consistent across builds. The private key is
-never included in either artifact; pull requests do not receive it.
-
-Use the ZIP for Chrome Web Store submissions. The self-signed CRX is for
-[distribution outside the store](https://developer.chrome.com/docs/extensions/how-to/distribute):
-on Windows and macOS, installing self-hosted extensions requires enterprise
-policies.
-
 ## How it works
 
 | File | Responsibility |
