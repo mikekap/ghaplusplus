@@ -36,7 +36,7 @@
     .gha-step-navigation { display: flex; gap: 8px; padding-right: 10px; }
     .gha-step-navigation-link { color: var(--fgColor-accent, #58a6ff); font-size: 14px; font-weight: 600; text-decoration: none; white-space: nowrap; }
     .gha-step-navigation-link:hover { text-decoration: underline; }
-    .gha-step-navigation-button { appearance: none; background: none; border: 0; cursor: pointer; font: inherit; padding: 0; }
+    .gha-step-navigation-button { appearance: none; background: none; border: 0; cursor: pointer; font-family: inherit; line-height: inherit; padding: 0; }
     .gha-step-navigation-button:disabled { cursor: wait; opacity: 0.65; }
     .gha-step--no-log { border-style: dashed; opacity: 0.75; }
     .gha-step--skipped .gha-step-title { position: static; }
@@ -665,9 +665,15 @@
   function StepLogView({
     step,
     index,
+    following,
+    onFollow,
+    onStopFollowing,
   }: {
     step: JobStep;
     index: number;
+    following: boolean;
+    onFollow: () => void;
+    onStopFollowing: () => void;
   }) {
     type State =
       | { status: "loading" }
@@ -679,6 +685,7 @@
     const [fetchingPrevious, setFetchingPrevious] = React.useState(false);
     const logContainer = React.useRef<HTMLDivElement>(null);
     const section = React.useRef<HTMLElement>(null);
+    const live = isLiveStep(step);
 
     React.useLayoutEffect(() => {
       const view = step.logView;
@@ -702,12 +709,37 @@
       if (!collapsed) step.logView?.prioritize();
     }, [collapsed, step.logView]);
 
+    React.useLayoutEffect(() => {
+      const target = section.current;
+      if (!following || !live || collapsed || !target) return undefined;
+      let frame = 0;
+      const follow = (): void => {
+        if (frame) return;
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          target.scrollIntoView({ block: "end", inline: "nearest", behavior: "instant" });
+        });
+      };
+      const observer = new ResizeObserver(follow);
+      observer.observe(target);
+      // Other steps loading can also move this step's bottom.
+      if (target.parentElement) observer.observe(target.parentElement);
+      window.addEventListener("resize", follow);
+      follow();
+      return () => {
+        observer.disconnect();
+        window.removeEventListener("resize", follow);
+        cancelAnimationFrame(frame);
+      };
+    }, [following, live, collapsed]);
+
     const title = step.name || `Step ${step.number ?? index + 1}`;
     const duration = stepDuration(step);
     const presentation = stepPresentation(step);
     const skipped = presentation.kind === "skipped";
     const logless = step.logView ? null : presentation;
     const scrollToStep = (position: "start" | "end"): void => {
+      onStopFollowing();
       const target = section.current;
       if (!target) return;
       const options = { block: position, inline: "nearest", behavior: "instant" as ScrollBehavior } as const;
@@ -716,6 +748,7 @@
     const fetchPrevious = (): void => {
       const view = step.logView;
       if (fetchingPrevious || state.status !== "ready" || state.complete || !view) return;
+      onStopFollowing();
       setFetchingPrevious(true);
       view.fetchPrevious();
     };
@@ -745,7 +778,11 @@
 
     return React.createElement(
       "section",
-      { ref: section, className: `gha-step gha-step--${presentation.kind}${logless ? " gha-step--no-log" : ""}` },
+      {
+        ref: section,
+        className: `gha-step gha-step--${presentation.kind}${logless ? " gha-step--no-log" : ""}`,
+        style: following && live && !collapsed ? { scrollMarginBottom: "10vh" } : undefined,
+      },
       React.createElement(
         "div",
         { className: "gha-step-title" },
@@ -759,7 +796,10 @@
           )
           : React.createElement(
             "button",
-            { className: "gha-step-toggle", type: "button", "aria-expanded": !collapsed, onClick: () => setCollapsed((value) => !value) },
+            { className: "gha-step-toggle", type: "button", "aria-expanded": !collapsed, onClick: () => {
+              if (!collapsed) onStopFollowing();
+              setCollapsed((value) => !value);
+            } },
             React.createElement("span", { className: "gha-step-chevron", "aria-hidden": true }, collapsed ? "▸" : "▾"),
             React.createElement("span", { className: "gha-step-icon", role: "img", "aria-label": presentation.label }, presentation.icon),
             title,
@@ -791,6 +831,19 @@
               scrollToStep("end");
             },
           }, "↓ End"),
+          live && step.logView && React.createElement("button", {
+            className: "gha-step-navigation-link gha-step-navigation-button",
+            type: "button",
+            "aria-pressed": following,
+            title: following ? "Stop following this step" : "Keep this step's latest output in view",
+            onClick: () => {
+              if (following) onStopFollowing();
+              else {
+                setCollapsed(false);
+                onFollow();
+              }
+            },
+          }, following ? "Following" : "Follow"),
         ),
       ),
       content,
@@ -813,6 +866,7 @@
     const [state, setState] = React.useState<State>({ status: "loading" });
     const [initialLoadsComplete, setInitialLoadsComplete] = React.useState(false);
     const [timestampsShown, setTimestampsShown] = React.useState(false);
+    const [followedStep, setFollowedStep] = React.useState<string | null>(null);
     const [pageLoadComplete, setPageLoadComplete] = React.useState(document.readyState === "complete");
     const scrollFloorRemoved = React.useRef(false);
 
@@ -950,11 +1004,17 @@
       React.Fragment,
       null,
       React.createElement("div", { className: "gha-muted" }, `Loaded ${state.steps.length} step${state.steps.length === 1 ? "" : "s"}.`),
-      React.createElement("div", { className: "gha-steps" }, state.steps.map((step, index) => React.createElement(StepLogView, {
-        key: step.id ?? step.log_url ?? `step-${index}`,
-        step,
-        index,
-      }))),
+      React.createElement("div", { className: "gha-steps" }, state.steps.map((step, index) => {
+        const key = step.id ?? step.log_url ?? `step-${index}`;
+        return React.createElement(StepLogView, {
+          key,
+          step,
+          index,
+          following: followedStep === key,
+          onFollow: () => setFollowedStep(key),
+          onStopFollowing: () => setFollowedStep(null),
+        });
+      })),
     );
 
     const rawLogsUrl = state.status === "ready" ? state.rawLogsUrl : null;
