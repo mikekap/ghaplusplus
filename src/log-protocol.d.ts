@@ -20,25 +20,28 @@ interface GitHubLiveLogEvent {
   lines: GitHubLiveLogLine[];
 }
 
-interface ConnectLiveBrokerMessage {
-  type: "gha-plusplus-connect-live-broker";
-}
-
-interface LiveBrokerCommand {
-  type: "subscribe-step-log";
-  stepId: string;
-}
-
-interface LiveBrokerEvent {
-  type: "step-log";
-  event: GitHubLiveLogEvent;
-}
-
 interface GitHubSocketTopic {
   name: string;
   signed: string;
-  offset: number;
+  offset: string | number;
 }
+
+interface SubscribeLiveBrokerMessage {
+  type: "gha-plusplus-subscribe-step-log";
+  stepId: string;
+}
+
+interface LiveStepLogEvent {
+  type: "gha-plusplus-step-log";
+  event: GitHubLiveLogEvent;
+}
+
+interface LiveStepsChangedEvent {
+  type: "gha-plusplus-steps-changed";
+  channel: string;
+}
+
+type LiveBrokerEvent = LiveStepLogEvent | LiveStepsChangedEvent;
 
 interface GitHubSocketEvent {
   channel: string;
@@ -78,7 +81,12 @@ interface CreateLogViewMessage {
   wrapColumns: number;
 }
 
-type LogWorkerMessage = InitializeLogSourceMessage | CreateLogViewMessage;
+interface AppendLiveLogMessage {
+  type: "append-live";
+  event: GitHubLiveLogEvent;
+}
+
+type LogWorkerMessage = InitializeLogSourceMessage | CreateLogViewMessage | AppendLiveLogMessage;
 
 type LogViewCommand =
   | { type: "load" }

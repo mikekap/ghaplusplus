@@ -59,35 +59,38 @@ function resolveSource(step: GitHubJobStep, stepsUrl: string): { url: string; ba
   return { url: new URL(step.log_url, new URL("/", stepsUrl)).href, backscroll: false };
 }
 
-function initializeSource(
-  step: GitHubJobStep,
-  stepsUrl: string,
-  livePort?: MessagePort,
-): void {
+function initializeSource(step: GitHubJobStep, stepsUrl: string): void {
   waitingForLiveOutput = ["queued", "requested", "pending", "waiting"].includes(step.status ?? "");
+  console.log("[GHA++ live] log worker initialized", JSON.stringify({
+    step,
+    stepsUrl,
+    waitingForLiveOutput,
+  }));
   sourceReady ??= wasmReady.then(() => {
     const source = resolveSource(step, stepsUrl);
     return new LogSource(source.url, source.backscroll);
   });
-  const ready = sourceReady;
-  if (livePort) {
-    livePort.onmessage = (event: MessageEvent<LiveBrokerEvent>): void => {
-      const message = event.data;
-      if (message.type !== "step-log") return;
-      void ready.then(async (source) => {
-        await loadSource(source);
-        if (source.append_live(message.event)) {
-          activeViews.forEach((view) => view.renderLive());
-        }
-      })
-        .catch((error: unknown) => activeViews.forEach((view) => view.reportError(error)));
-    };
-    livePort.postMessage({
-      type: "subscribe-step-log",
-      stepId: step.id!,
-    } satisfies LiveBrokerCommand);
-    livePort.start();
-  }
+}
+
+function appendLive(event: GitHubLiveLogEvent): void {
+  console.log("[GHA++ live] log worker received step log", JSON.stringify(event));
+  const ready = sourceReady ?? Promise.reject(new Error("Log worker source was not initialized"));
+  void ready.then(async (source) => {
+    await loadSource(source);
+    const changed = source.append_live(event);
+    console.log("[GHA++ live] Rust append complete", {
+      stepId: event.stepId,
+      changed,
+      activeViews: activeViews.size,
+    });
+    if (changed) {
+      activeViews.forEach((view) => view.renderLive());
+    }
+  })
+    .catch((error: unknown) => {
+      console.error("[GHA++ live] append failed", error);
+      activeViews.forEach((view) => view.reportError(error));
+    });
 }
 
 function loadSource(source: LogSource): Promise<void> {
@@ -177,7 +180,11 @@ function createView(source: LogSource, port: MessagePort, wrapColumns: number): 
 self.addEventListener("message", (event: MessageEvent<LogWorkerMessage>) => {
   const message = event.data;
   if (message.type === "initialize-source") {
-    initializeSource(message.step, message.stepsUrl, event.ports[0]);
+    initializeSource(message.step, message.stepsUrl);
+    return;
+  }
+  if (message.type === "append-live") {
+    appendLive(message.event);
     return;
   }
   const port = event.ports[0];

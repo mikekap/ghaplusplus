@@ -15,6 +15,7 @@
   const resizeObservers = new WeakMap<HTMLElement, ResizeObserver>();
   const stickyToolbarDisposers = new WeakMap<HTMLElement, () => void>();
   const scrollRestorationFloors = new WeakMap<HTMLElement, HTMLStyleElement>();
+  const liveLogSubscribers = new Map<string, (event: GitHubLiveLogEvent) => void>();
   const JOB_PATH = /^\/[^/]+\/[^/]+\/actions\/runs\/\d+\/job\/\d+\/?$/;
   const SCROLL_RESTORATION_MIN_HEIGHT = "10000000px";
   const QUEUED_STEP_STATUSES = ["queued", "requested", "pending", "waiting"];
@@ -58,13 +59,29 @@
     .gha-log-status { padding: 10px; }
   `;
 
-  function createLiveLogPort(step: GitHubJobStep): MessagePort | null {
-    if (!isLiveStep(step) || !step.id) return null;
-    const channel = new MessageChannel();
-    window.postMessage({
-      type: "gha-plusplus-connect-live-broker",
-    } satisfies ConnectLiveBrokerMessage, location.origin, [channel.port1]);
-    return channel.port2;
+  window.addEventListener("message", (event: MessageEvent<LiveBrokerEvent>) => {
+    if (event.data?.type !== "gha-plusplus-step-log") return;
+    const log = event.data.event;
+    console.log("[GHA++ live] React received step log", JSON.stringify({
+      event: log,
+      subscribed: liveLogSubscribers.has(log.stepId),
+    }));
+    liveLogSubscribers.get(log.stepId)?.(log);
+  });
+
+  function subscribeLiveLog(
+    stepId: string,
+    subscriber: (event: GitHubLiveLogEvent) => void,
+    signal: AbortSignal,
+  ): void {
+    liveLogSubscribers.set(stepId, subscriber);
+    const message = {
+      type: "gha-plusplus-subscribe-step-log",
+      stepId,
+    } satisfies SubscribeLiveBrokerMessage;
+    console.log("[GHA++ live] React send", JSON.stringify(message));
+    window.postMessage(message, location.origin);
+    signal.addEventListener("abort", () => liveLogSubscribers.delete(stepId), { once: true });
   }
 
   function isQueuedStep(step: GitHubJobStep): boolean {
@@ -214,7 +231,6 @@
           cleanupLoad();
           const hostWindow = host.contentWindow;
           if (hostWindow) {
-            const livePort = createLiveLogPort(this.step);
             hostWindow.postMessage(
               {
                 type: "initialize-source",
@@ -222,8 +238,19 @@
                 stepsUrl: this.stepsUrl,
               } satisfies InitializeLogSourceMessage,
               WORKER_HOST_ORIGIN,
-              livePort ? [livePort] : [],
             );
+            if (isLiveStep(this.step) && this.step.id) {
+              subscribeLiveLog(this.step.id, (event) => {
+                console.log("[GHA++ live] forwarding step log to worker", {
+                  stepId: event.stepId,
+                  lines: event.lines.length,
+                });
+                hostWindow.postMessage({
+                  type: "append-live",
+                  event,
+                } satisfies AppendLiveLogMessage, WORKER_HOST_ORIGIN);
+              }, signal);
+            }
             resolve(hostWindow);
           } else {
             signal.removeEventListener("abort", handleAbort);
@@ -669,11 +696,11 @@
         });
       });
       return () => view.detach(container);
-    }, [step]);
+    }, [step.logView]);
 
     React.useEffect(() => {
       if (!collapsed) step.logView?.prioritize();
-    }, [collapsed, step]);
+    }, [collapsed, step.logView]);
 
     const title = step.name || `Step ${step.number ?? index + 1}`;
     const duration = stepDuration(step);
@@ -831,15 +858,19 @@
       const prioritizer = new LogLoadPrioritizer(signal, () => {
         if (!signal.aborted) setInitialLoadsComplete(true);
       });
+      const logViews = new Map<string, LogViewClient>();
+      let refreshing = false;
+      let refreshRequested = false;
+      let loaded = false;
 
       async function loadSteps(): Promise<void> {
-        setState({ status: "loading" });
         const stepsRequest = await fetch(stepsUrl, {
           headers: { Accept: "application/json" },
           signal,
         });
         if (!stepsRequest.ok) throw new Error(`Steps request failed with HTTP ${stepsRequest.status}`);
         const rawSteps = await stepsRequest.json() as JobStep[];
+        if (signal.aborted) return;
         const stepLogUrl = rawSteps.find((step) => step.log_url)?.log_url;
         let rawLogsUrl: string | null = null;
         if (stepLogUrl) {
@@ -853,6 +884,9 @@
           }
         }
         const steps = rawSteps.map((step) => {
+          const key = step.id ?? step.log_url ?? `step-${step.number}`;
+          const existingView = logViews.get(key);
+          if (existingView) return { ...step, logView: existingView };
           const live = isLiveStep(step);
           if ((!step.log_url && !(live && step.id)) || stepPresentation(step).kind === "skipped") {
             return step;
@@ -862,25 +896,48 @@
             new URL(stepsUrl, location.origin).href,
             signal,
           );
-          return {
-            ...step,
-            logView: new LogViewClient(
-              source,
-              prioritizer,
-              !isCollapsedByDefault(step),
-              signal,
-              host,
-            ),
-          };
+          const logView = new LogViewClient(
+            source,
+            prioritizer,
+            !isCollapsedByDefault(step),
+            signal,
+            host,
+          );
+          logViews.set(key, logView);
+          return { ...step, logView };
         });
         prioritizer.start();
         setState({ status: "ready", steps, rawLogsUrl });
+        loaded = true;
       }
 
-      loadSteps().catch((error: unknown) => {
-        if (signal.aborted) return;
-        setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
-      });
+      async function refreshSteps(): Promise<void> {
+        refreshRequested = true;
+        if (refreshing) return;
+        refreshing = true;
+        try {
+          do {
+            refreshRequested = false;
+            await loadSteps();
+          } while (refreshRequested && !signal.aborted);
+        } catch (error) {
+          if (signal.aborted) return;
+          console.error("[GHA++ live] step metadata refresh failed", error);
+          if (!loaded) setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
+        } finally {
+          refreshing = false;
+        }
+      }
+
+      const handleStepsChanged = (event: MessageEvent<LiveBrokerEvent>): void => {
+        if (event.source !== window || event.origin !== location.origin) return;
+        if (event.data?.type !== "gha-plusplus-steps-changed") return;
+        console.log("[GHA++ live] refreshing step metadata", JSON.stringify(event.data));
+        void refreshSteps();
+      };
+      window.addEventListener("message", handleStepsChanged, { signal });
+      setState({ status: "loading" });
+      void refreshSteps();
       return () => {
         controller.abort();
       };
