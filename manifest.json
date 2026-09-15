@@ -3,6 +3,9 @@
   "name": "GHA++",
   "version": "0.1.0",
   "description": "Improves the GitHub Actions job experience.",
+  "icons": {
+    "128": "icons/ghaplusplus.png"
+  },
   "permissions": ["storage"],
   "options_ui": {
     "page": "options.html",
@@ -10,6 +13,7 @@
   },
   "action": {
     "default_title": "GHA++",
+    "default_icon": "icons/ghaplusplus.png",
     "default_popup": "popup.html"
   },
   "content_security_policy": {
