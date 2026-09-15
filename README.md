@@ -61,6 +61,16 @@ Run a full build first. After editing Rust, run `npm run build:wasm` or the full
 build again. After rebuilding, reload the extension in `chrome://extensions`
 and refresh the GitHub page. Generated files in `dist/` are not committed.
 
+## Continuous integration
+
+[GitHub Actions](https://github.com/mikekap/ghaplusplus/actions/workflows/ci.yml)
+runs Rust tests and builds the extension on pushes to `master` and pull requests.
+You can also start it manually from the Actions tab.
+
+Each successful run uploads a `ghaplusplus-<commit>` artifact. Download its ZIP
+for the Chrome Web Store, or extract it and use **Load unpacked** in Chrome.
+The archive contains the manifest, icons, HTML, and compiled JavaScript/WASM.
+
 ## How it works
 
 | File | Responsibility |

@@ -1,0 +1,57 @@
+name: Build and test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extension:
+    name: Test and build extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Test Rust
+        run: cargo test --locked --manifest-path wasm/Cargo.toml
+
+      - name: Build WASM and TypeScript
+        run: npm run build
+
+      - name: Upload extension ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghaplusplus-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            manifest.json
+            options.html
+            popup.html
+            worker-host.html
+            icons/ghaplusplus.png
+            dist/*.js
+            dist/vendor/*.js
+            dist/wasm/*.js
+            dist/wasm/*.wasm
