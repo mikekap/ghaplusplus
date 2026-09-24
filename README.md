@@ -96,6 +96,9 @@ Historical protocol investigation is in [LIVE-SOCKET.md](LIVE-SOCKET.md).
 
 ## Debugging live output
 
+For data handling, storage, and diagnostic logging details, see the
+[Privacy Policy](PRIVACY.md).
+
 The current development build emits verbose `[GHA++ live]` console logs for
 subscriptions, incoming events, forwarding, and Rust appends. These include
 signed subscription/session values and full log payloads; redact those before
