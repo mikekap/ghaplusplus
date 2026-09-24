@@ -92,6 +92,10 @@ using the same script and name. It forwards GitHub's `connect` command followed
 by an `actions_results` subscription on its own port. Live messages pass through
 the app and extension iframe to the Rust-backed worker.
 
+The popup and options toggle control both the viewer and live bridge. Open
+GitHub pages reload when the setting changes; disabled pages do not create a
+broker connection or subscribe to live updates.
+
 Historical protocol investigation is in [LIVE-SOCKET.md](LIVE-SOCKET.md).
 
 ## Privacy and troubleshooting

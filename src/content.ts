@@ -15,6 +15,20 @@
   const extensionGlobal = globalThis as typeof globalThis & {
     GHAPlusPlusReactApp?: GHAPlusPlusReactApp;
   };
+  const enabled = extensionChrome.storage.sync.get({ [ENABLED_SETTING]: true })
+    .then((settings) => settings[ENABLED_SETTING] ?? true);
+
+  function sendViewerEnabled(): void {
+    void enabled.then((enabled) => {
+      window.postMessage({ type: "gha-plusplus-viewer-enabled", enabled } satisfies ViewerEnabledMessage, location.origin);
+    });
+  }
+
+  window.addEventListener("message", (event: MessageEvent<RequestViewerEnabledMessage>) => {
+    if (event.source !== window || event.origin !== location.origin) return;
+    if (event.data?.type === "gha-plusplus-request-viewer-enabled") sendViewerEnabled();
+  });
+  sendViewerEnabled();
 
   function currentNavigationHref(): string {
     const hashIndex = location.href.indexOf("#");
@@ -82,11 +96,6 @@
     activeHost = null;
   }
 
-  async function viewerEnabled(): Promise<boolean> {
-    const settings = await extensionChrome.storage.sync.get({ [ENABLED_SETTING]: true });
-    return settings[ENABLED_SETTING] ?? true;
-  }
-
   async function mountJobLogApp(expectedUrl: string, generation: number): Promise<void> {
     const [stepsElement, search, logContainer] = await Promise.all([
       waitForElement<HTMLElement>("[data-job-steps-url]"),
@@ -108,12 +117,21 @@
     const generation = ++navigationGeneration;
     disposeActiveJobLog();
     if (url.hostname !== "github.com" || !JOB_PATH.test(url.pathname)) return;
-    if (!await viewerEnabled()) return;
-    if (generation !== navigationGeneration || currentNavigationHref() !== url.href) return;
     await mountJobLogApp(url.href, generation);
   }
 
-  onNavigation(handleNavigation);
+  // Capture GitHub's socket topics before mounting replaces its log markup.
+  const handleBridgeReady = (event: MessageEvent<LiveBridgeReadyMessage>): void => {
+    if (event.source !== window || event.origin !== location.origin) return;
+    if (event.data?.type !== "gha-plusplus-live-bridge-ready") return;
+    window.removeEventListener("message", handleBridgeReady);
+    void enabled.then((enabled) => {
+      if (!enabled) return;
+      extensionGlobal.GHAPlusPlusReactApp?.prepareScrollRestoration();
+      onNavigation(handleNavigation);
+    });
+  };
+  window.addEventListener("message", handleBridgeReady);
   extensionChrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "sync" || !(ENABLED_SETTING in changes)) return;
     location.reload();

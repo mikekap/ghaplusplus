@@ -50,11 +50,11 @@ Closing the page releases its active viewer state; browser caching is controlled
 by the browser.
 The enable/disable preference persists in Chrome storage until changed or cleared.
 
-The live bridge is loaded on GitHub pages, including pages outside Actions. In the
-current version, the in-extension disable switch turns off the replacement viewer,
-but does not stop this bridge. To stop all extension
-activity, disable or remove GHA++ in Chrome's extension manager and reload or close
-existing GitHub tabs.
+The enable/disable switch controls both the replacement viewer and the live
+bridge. Changing it reloads open GitHub pages to apply the setting. When disabled,
+GHA++ does not open its live socket port, subscribe to Actions events, monitor the
+page for log topics, or fetch job logs. You can also disable or remove the
+extension in Chrome's extension manager.
 
 ## Use and sharing restrictions
 

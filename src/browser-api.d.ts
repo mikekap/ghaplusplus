@@ -19,6 +19,7 @@ interface ExtensionChrome {
 }
 
 interface GHAPlusPlusReactApp {
+  prepareScrollRestoration(): void;
   mount(
     search: HTMLElement,
     logContainer: HTMLElement,

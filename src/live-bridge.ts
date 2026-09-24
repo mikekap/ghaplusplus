@@ -9,7 +9,6 @@
   const stepLogSubscribers = new Set<string>();
   let brokerPort: MessagePort | undefined;
   let actionsResultsTopic: GitHubSocketTopic | undefined;
-  let githubConnected = false;
   let subscribedTopic: string | undefined;
 
   function handleGitHubEvent(event: MessageEvent<GitHubSocketEvent>): void {
@@ -36,7 +35,7 @@
   }
 
   function subscribeToActionsResults(): void {
-    if (!githubConnected || !brokerPort || !actionsResultsTopic) return;
+    if (!brokerPort || !actionsResultsTopic) return;
     if (subscribedTopic === actionsResultsTopic.signed) return;
     const command = { subscribe: [actionsResultsTopic] };
     brokerPort.postMessage(command);
@@ -69,42 +68,67 @@
     root.querySelectorAll(SOCKET_CHANNEL_SELECTOR).forEach(captureActionsResultsTopic);
   }
 
-  captureActionsResultsTopics(document);
-  new MutationObserver((records) => {
-    for (const record of records) {
-      record.addedNodes.forEach((node) => {
-        if (!(node instanceof Element)) return;
-        captureActionsResultsTopics(node);
-      });
-    }
-  }).observe(document, { childList: true, subtree: true });
-
-  function startBroker(githubWorker: SharedWorker, brokerWorker: SharedWorker): void {
-    brokerPort = brokerWorker.port;
-    const postMessage = githubWorker.port.postMessage;
-    githubWorker.port.postMessage = function (message: unknown): void {
-      Reflect.apply(postMessage, this, arguments);
-      if (!(message && typeof message === "object" && "connect" in message)) return;
-      brokerWorker.port.postMessage(message);
-      githubConnected = true;
-      subscribeToActionsResults();
+  const enabled = new Promise<boolean>((resolve) => {
+    const handleEnabled = (event: MessageEvent<ViewerEnabledMessage>): void => {
+      if (event.source !== window || event.origin !== location.origin) return;
+      if (event.data?.type !== "gha-plusplus-viewer-enabled") return;
+      window.removeEventListener("message", handleEnabled);
+      resolve(event.data.enabled);
     };
-    brokerWorker.port.addEventListener("message", handleGitHubEvent);
-    brokerWorker.port.start();
-  }
-
-  window.SharedWorker = new Proxy(NativeSharedWorker, {
-    construct(target, args, newTarget) {
-      window.SharedWorker = NativeSharedWorker;
-      const worker = Reflect.construct(target, args, newTarget) as SharedWorker;
-      const brokerWorker = Reflect.construct(target, args, target) as SharedWorker;
-      startBroker(worker, brokerWorker);
-      return worker;
-    },
+    window.addEventListener("message", handleEnabled);
   });
 
-  window.addEventListener("message", (event: MessageEvent<SubscribeLiveBrokerMessage>) => {
-    if (event.data?.type !== "gha-plusplus-subscribe-step-log") return;
-    stepLogSubscribers.add(event.data.stepId);
+  // GitHub may connect before the asynchronous settings read finishes. Capture
+  // its first connect command, but don't open our own port until enabled.
+  let restoreCapture = (): void => { window.SharedWorker = NativeSharedWorker; };
+  const connection = new Promise<{ args: unknown[]; connect: unknown }>((resolve) => {
+    window.SharedWorker = new Proxy(NativeSharedWorker, {
+      construct(target, args, newTarget) {
+        window.SharedWorker = NativeSharedWorker;
+        const worker = Reflect.construct(target, args, newTarget) as SharedWorker;
+        const postMessage = worker.port.postMessage;
+        restoreCapture = (): void => { worker.port.postMessage = postMessage; };
+        worker.port.postMessage = function (message: unknown): void {
+          Reflect.apply(postMessage, this, arguments);
+          if (!(message && typeof message === "object" && "connect" in message)) return;
+          restoreCapture();
+          resolve({ args, connect: message });
+        };
+        return worker;
+      },
+    });
   });
+
+  void enabled.then(async (enabled) => {
+    if (!enabled) {
+      restoreCapture();
+      return;
+    }
+    captureActionsResultsTopics(document);
+    new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (!(node instanceof Element)) return;
+          captureActionsResultsTopics(node);
+        });
+      }
+    }).observe(document, { childList: true, subtree: true });
+
+    window.addEventListener("message", (event: MessageEvent<SubscribeLiveBrokerMessage>) => {
+      if (event.source !== window || event.origin !== location.origin) return;
+      if (event.data?.type !== "gha-plusplus-subscribe-step-log") return;
+      stepLogSubscribers.add(event.data.stepId);
+    });
+
+    window.postMessage({ type: "gha-plusplus-live-bridge-ready" } satisfies LiveBridgeReadyMessage, location.origin);
+    const { args, connect } = await connection;
+    const brokerWorker = Reflect.construct(NativeSharedWorker, args) as SharedWorker;
+    brokerPort = brokerWorker.port;
+    brokerPort.addEventListener("message", handleGitHubEvent);
+    brokerPort.start();
+    brokerPort.postMessage(connect);
+    subscribeToActionsResults();
+  });
+
+  window.postMessage({ type: "gha-plusplus-request-viewer-enabled" } satisfies RequestViewerEnabledMessage, location.origin);
 })();

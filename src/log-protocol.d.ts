@@ -31,6 +31,19 @@ interface SubscribeLiveBrokerMessage {
   stepId: string;
 }
 
+interface RequestViewerEnabledMessage {
+  type: "gha-plusplus-request-viewer-enabled";
+}
+
+interface ViewerEnabledMessage {
+  type: "gha-plusplus-viewer-enabled";
+  enabled: boolean;
+}
+
+interface LiveBridgeReadyMessage {
+  type: "gha-plusplus-live-bridge-ready";
+}
+
 interface LiveStepLogEvent {
   type: "gha-plusplus-step-log";
   event: GitHubLiveLogEvent;

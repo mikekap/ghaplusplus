@@ -94,9 +94,7 @@
     return floor;
   }
 
-  let pendingScrollRestorationFloor = JOB_PATH.test(location.pathname)
-    ? createScrollRestorationFloor()
-    : null;
+  let pendingScrollRestorationFloor: HTMLStyleElement | null = null;
   window.addEventListener("load", () => {
     window.requestAnimationFrame(() => {
       pendingScrollRestorationFloor?.remove();
@@ -1042,6 +1040,11 @@
   }
 
   extensionGlobal.GHAPlusPlusReactApp = {
+    prepareScrollRestoration(): void {
+      if (JOB_PATH.test(location.pathname) && document.readyState !== "complete") {
+        pendingScrollRestorationFloor = createScrollRestorationFloor();
+      }
+    },
     mount(search, logContainer, stepsUrl): HTMLElement {
       const host = document.createElement("div");
       const scrollRestorationFloor = pendingScrollRestorationFloor

@@ -37,6 +37,9 @@ jobs:
       - name: Test Rust
         run: cargo test --locked --manifest-path wasm/Cargo.toml
 
+      - name: Test extension startup
+        run: npm test
+
       - name: Build WASM and TypeScript
         run: npm run build
 
