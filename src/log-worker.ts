@@ -61,11 +61,6 @@ function resolveSource(step: GitHubJobStep, stepsUrl: string): { url: string; ba
 
 function initializeSource(step: GitHubJobStep, stepsUrl: string): void {
   waitingForLiveOutput = ["queued", "requested", "pending", "waiting"].includes(step.status ?? "");
-  console.log("[GHA++ live] log worker initialized", JSON.stringify({
-    step,
-    stepsUrl,
-    waitingForLiveOutput,
-  }));
   sourceReady ??= wasmReady.then(() => {
     const source = resolveSource(step, stepsUrl);
     return new LogSource(source.url, source.backscroll);
@@ -73,22 +68,15 @@ function initializeSource(step: GitHubJobStep, stepsUrl: string): void {
 }
 
 function appendLive(event: GitHubLiveLogEvent): void {
-  console.log("[GHA++ live] log worker received step log", JSON.stringify(event));
   const ready = sourceReady ?? Promise.reject(new Error("Log worker source was not initialized"));
   void ready.then(async (source) => {
     await loadSource(source);
     const changed = source.append_live(event);
-    console.log("[GHA++ live] Rust append complete", {
-      stepId: event.stepId,
-      changed,
-      activeViews: activeViews.size,
-    });
     if (changed) {
       activeViews.forEach((view) => view.renderLive());
     }
   })
     .catch((error: unknown) => {
-      console.error("[GHA++ live] append failed", error);
       activeViews.forEach((view) => view.reportError(error));
     });
 }

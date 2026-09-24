@@ -55,7 +55,7 @@
       if (nextUrl === deliveredUrl) return;
 
       deliveredUrl = nextUrl;
-      void callback(url).catch((error: unknown) => console.error("GHA++ navigation failed", error));
+      void callback(url).catch(() => console.error("GHA++ navigation failed"));
     };
     const schedule = (): void => {
       if (scheduled || currentNavigationHref() === deliveredUrl) return;

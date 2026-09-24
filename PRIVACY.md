@@ -14,8 +14,9 @@ confidential information present in your repositories or workflow output.
 
 For live updates, GHA++ observes GitHub's SharedWorker connection and messages,
 uses GitHub-provided signed subscription tokens and socket-session URLs, and
-subscribes to Actions events. Account identifiers and other GitHub socket
-messages, including notification events, may be encountered by this bridge.
+subscribes to Actions events. Account identifiers may be present in connection
+information and subscription metadata. The bridge does not attach a listener to
+GitHub's own port to inspect unrelated incoming messages.
 Authenticated requests use your existing GitHub session; GHA++ does not ask you
 to enter your GitHub password or a personal access token.
 
@@ -41,25 +42,19 @@ may sync this preference through your Google account according to your browser
 settings. GHA++ does not put log contents or GitHub credentials into Chrome
 extension storage.
 
-## Diagnostic logging and retention
-
-The current version writes verbose diagnostics to the local browser developer
-console. These can include full log payloads, job metadata, account identifiers,
-signed subscription tokens, socket-session URLs, and other observed GitHub socket
-messages. GHA++ does not automatically upload these diagnostics. Do not share
-console exports publicly without removing credentials and private information.
+## Retention and controls
 
 Fetched logs and live data are held in memory for the viewer. GHA++ does not create
-a persistent log database. Closing the page releases its active viewer state;
-browser caching and developer-console retention are controlled by the browser.
+a persistent log database or write log payloads and session tokens to the console.
+Closing the page releases its active viewer state; browser caching is controlled
+by the browser.
 The enable/disable preference persists in Chrome storage until changed or cleared.
 
 The live bridge is loaded on GitHub pages, including pages outside Actions. In the
 current version, the in-extension disable switch turns off the replacement viewer,
-but does not stop this bridge or its diagnostic logging. To stop all extension
+but does not stop this bridge. To stop all extension
 activity, disable or remove GHA++ in Chrome's extension manager and reload or close
-existing GitHub tabs. You can also clear the developer console and its saved
-exports separately.
+existing GitHub tabs.
 
 ## Use and sharing restrictions
 
@@ -68,9 +63,9 @@ the Limited Use requirements. User data is used to provide and troubleshoot the
 GitHub Actions viewer, not for advertising, profiling, sale, creditworthiness, or
 lending decisions. Data is not sold or transferred to data brokers. The service
 communications and Chrome preference sync described above support the extension's
-functionality; there is no automatic transfer of diagnostics to the developer.
+functionality; there is no automatic transfer of user data to the developer.
 
-If you choose to send a bug report or console export to the developer, the content
+If you choose to send a bug report to the developer, the content
 you send will be available to its recipients. GitHub issues are public: do not
 include secrets, private repository logs, or other confidential data in them.
 

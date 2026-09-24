@@ -8,9 +8,6 @@ use std::cell::{Cell, RefCell};
 use std::fmt::Write;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
-use tracing::error;
-use tracing::warn;
-use tracing_subscriber::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -544,10 +541,8 @@ impl LogParser {
             // console and starve the page.
             .unwrap_or_else(|| (Self::fallback_date(), text));
 
-        let html = ansi_to_html::convert(&raw_text).unwrap_or_else(|err| {
-            warn!("Failed to convert log line to html; using raw line: {raw_text}, {err:?}");
-            html_escape::encode_text(raw_text).to_string()
-        });
+        let html = ansi_to_html::convert(&raw_text)
+            .unwrap_or_else(|_| html_escape::encode_text(raw_text).to_string());
         LogElement::Line(date.into(), html, byte_offset)
     }
 
@@ -729,10 +724,7 @@ where
     T: Serialize,
 {
     Ok(serde_wasm_bindgen::to_value(&lines)
-        .unwrap_or_else(|err| {
-            error!("Failed to convert to JS: {err:?}");
-            Array::new().into()
-        })
+        .unwrap_or_else(|_| Array::new().into())
         .dyn_into::<Array>()
         .unwrap())
 }
@@ -740,14 +732,6 @@ where
 #[wasm_bindgen(start)]
 pub fn init() {
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_writer(tracing_subscriber_wasm::MakeConsoleWriter::default()),
-        )
-        .init();
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GHA++",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Improves the GitHub Actions job experience.",
   "icons": {
     "128": "icons/ghaplusplus.png"

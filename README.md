@@ -94,16 +94,12 @@ the app and extension iframe to the Rust-backed worker.
 
 Historical protocol investigation is in [LIVE-SOCKET.md](LIVE-SOCKET.md).
 
-## Debugging live output
+## Privacy and troubleshooting
 
-For data handling, storage, and diagnostic logging details, see the
+For data handling and storage details, see the
 [Privacy Policy](PRIVACY.md).
 
-The current development build emits verbose `[GHA++ live]` console logs for
-subscriptions, incoming events, forwarding, and Rust appends. These include
-signed subscription/session values and full log payloads; redact those before
-sharing a dump publicly.
-
-When troubleshooting, check the browser console for the outgoing broker
-`connect` and `subscribe`, incoming GitHub messages, and worker append results.
-A successful build verifies compilation, not live delivery from GitHub.
+The extension does not dump log payloads or GitHub session/subscription values
+to the console. Debug-mode WASM and panic stack traces remain available for
+troubleshooting. A successful build verifies compilation, not live delivery
+from GitHub.

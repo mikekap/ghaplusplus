@@ -62,10 +62,6 @@
   window.addEventListener("message", (event: MessageEvent<LiveBrokerEvent>) => {
     if (event.data?.type !== "gha-plusplus-step-log") return;
     const log = event.data.event;
-    console.log("[GHA++ live] React received step log", JSON.stringify({
-      event: log,
-      subscribed: liveLogSubscribers.has(log.stepId),
-    }));
     liveLogSubscribers.get(log.stepId)?.(log);
   });
 
@@ -79,7 +75,6 @@
       type: "gha-plusplus-subscribe-step-log",
       stepId,
     } satisfies SubscribeLiveBrokerMessage;
-    console.log("[GHA++ live] React send", JSON.stringify(message));
     window.postMessage(message, location.origin);
     signal.addEventListener("abort", () => liveLogSubscribers.delete(stepId), { once: true });
   }
@@ -241,10 +236,6 @@
             );
             if (isLiveStep(this.step) && this.step.id) {
               subscribeLiveLog(this.step.id, (event) => {
-                console.log("[GHA++ live] forwarding step log to worker", {
-                  stepId: event.stepId,
-                  lines: event.lines.length,
-                });
                 hostWindow.postMessage({
                   type: "append-live",
                   event,
@@ -900,8 +891,8 @@
         setTimeout(() => {
           document.querySelector('*[data-active]')?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
         }, 1000);
-      } catch (e) {
-        console.warn(`Failed to scroll active step into view: ${e}`);
+      } catch {
+        console.warn("GHA++ failed to scroll active step into view");
       }
     }, [state.status]);
 
@@ -976,7 +967,7 @@
           } while (refreshRequested && !signal.aborted);
         } catch (error) {
           if (signal.aborted) return;
-          console.error("[GHA++ live] step metadata refresh failed", error);
+          console.error("GHA++ step metadata refresh failed");
           if (!loaded) setState({ status: "error", message: error instanceof Error ? error.message : String(error) });
         } finally {
           refreshing = false;
@@ -986,7 +977,6 @@
       const handleStepsChanged = (event: MessageEvent<LiveBrokerEvent>): void => {
         if (event.source !== window || event.origin !== location.origin) return;
         if (event.data?.type !== "gha-plusplus-steps-changed") return;
-        console.log("[GHA++ live] refreshing step metadata", JSON.stringify(event.data));
         void refreshSteps();
       };
       window.addEventListener("message", handleStepsChanged, { signal });
